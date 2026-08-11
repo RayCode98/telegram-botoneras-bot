@@ -4,7 +4,12 @@ import html
 import logging
 from datetime import datetime, timedelta, time
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.constants import ChatMemberStatus, ChatType
 from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
@@ -43,6 +48,7 @@ from .keyboards import (
     participant_notifications_keyboard,
     participant_withdraw_confirm_keyboard,
     participant_add_channel_keyboard,
+    manual_channel_verification_keyboard,
     appeal_admin_keyboard,
     system_admin_keyboard,
     system_back_keyboard,
@@ -76,6 +82,30 @@ def parse_category(value: str | None) -> str | None:
     return value if value in CATEGORIES else None
 
 
+MANUAL_CHANNEL_REQUEST_ID = 61001
+
+
+def invite_mode_label(value: str | None) -> str:
+    labels = {
+        "direct": "Ingreso directo",
+        "approval": "Solicitud de ingreso",
+        # Compatibilidad visual si se abre una base todavía no migrada.
+        "public": "Ingreso directo",
+        "private": "Ingreso directo",
+    }
+    return labels.get(value or "", value or "—")
+
+
+def required_channel_permissions(member) -> list[str]:
+    required = (
+        ("can_post_messages", "Publicar mensajes"),
+        ("can_edit_messages", "Editar mensajes"),
+        ("can_delete_messages", "Eliminar mensajes"),
+        ("can_invite_users", "Invitar usuarios / crear enlaces"),
+    )
+    return [label for attr, label in required if not bool(getattr(member, attr, False))]
+
+
 def fmt_channel(ch: dict) -> str:
     owner = ch.get("owner_user_id")
     sanction = db.get_sanction(owner) if owner else {"strikes": 0, "banned": 0}
@@ -86,7 +116,7 @@ def fmt_channel(ch: dict) -> str:
         f"Miembros: <b>{int(ch.get('member_count') or 0):,}</b>\n"
         f"Categoría: <b>{html.escape(ch.get('category') or '—')}</b>\n"
         + (f"Próxima categoría: <b>{html.escape(ch.get('pending_category'))}</b> 🔄\n" if ch.get("pending_category") else "")
-        + f"Enlace: <b>{html.escape(ch.get('invite_type') or '—')}</b>\n"
+        + f"Ingreso: <b>{html.escape(invite_mode_label(ch.get('invite_type')))}</b>\n"
         f"Color: <b>{html.escape(ch.get('button_style') or 'default')}</b>\n"
         f"Estado: <b>{html.escape(ch.get('status') or '—')}</b>\n"
         f"Permisos: <b>{'✅ OK' if ch.get('permissions_ok', 1) else '⚠️ incompletos'}</b>\n"
@@ -249,7 +279,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_html(
         "<b>Propietarios</b>\n"
         "/start — registrar chat privado\n"
-        "/miscanales — ver/editar canales\n\n"
+        "/miscanales — ver/editar canales\n/verificarcanal — recuperar manualmente un canal ya agregado\n\n"
         "<b>Administradores</b>\n"
         "/panel — panel visual completo\n"
         "/publicar 5K — publicar ahora\n/eliminarpublicacion 5K — borrar la botonera activa de todos los canales\n"
@@ -284,6 +314,204 @@ async def my_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def send_manual_channel_verification(target_message):
+    """Muestra el selector nativo de Telegram para verificar un canal ya agregado."""
+    await target_message.reply_html(
+        "✅ <b>Verificación manual de canal</b>\n\n"
+        "Pulsa el botón inferior y selecciona el canal. Telegram solo mostrará canales "
+        "compatibles con los permisos solicitados. Después comprobaré en tiempo real que:\n\n"
+        "• tú seas propietario/administrador del canal;\n"
+        "• el bot sea administrador;\n"
+        "• tenga permisos para publicar, editar, eliminar e invitar usuarios.\n\n"
+        "Esto sirve especialmente cuando el bot ya aparece como administrador pero el alta automática no llegó.",
+        reply_markup=manual_channel_verification_keyboard(MANUAL_CHANNEL_REQUEST_ID),
+    )
+
+
+async def verify_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat or chat.type != ChatType.PRIVATE:
+        return
+    if await deny_if_banned(user.id, update.effective_message):
+        return
+    await send_manual_channel_verification(update.effective_message)
+
+
+async def manual_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recupera un alta cuando my_chat_member no llegó o ya expiró.
+
+    No confía únicamente en el objeto ChatShared: vuelve a consultar a Telegram
+    tanto el estado del bot como el del usuario solicitante antes de vincular el
+    canal a la cuenta.
+    """
+    msg = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    shared = getattr(msg, "chat_shared", None) if msg else None
+    if not msg or not user or not chat or chat.type != ChatType.PRIVATE or not shared:
+        return
+
+    if int(getattr(shared, "request_id", -1)) != MANUAL_CHANNEL_REQUEST_ID:
+        return
+
+    # Quita inmediatamente el teclado de selección para evitar dobles envíos.
+    try:
+        await msg.reply_text("🔎 Verificando canal con Telegram…", reply_markup=ReplyKeyboardRemove())
+    except TelegramError:
+        pass
+
+    if db.is_banned(user.id) and not is_admin(user.id):
+        await msg.reply_html("🚫 Tu cuenta está bloqueada y no puede registrar nuevos canales.")
+        return
+
+    chat_id = int(shared.chat_id)
+    existing = db.get_channel(chat_id)
+
+    # Protección contra apropiación: nunca se sustituye al responsable existente.
+    if (
+        existing and existing.get("owner_user_id")
+        and int(existing["owner_user_id"]) != int(user.id)
+        and not is_admin(user.id)
+    ):
+        db.record_ownership_conflict(
+            chat_id,
+            existing.get("owner_user_id"),
+            user.id,
+            user.username,
+            "Intento de verificación manual de un canal ya registrado por otra cuenta.",
+        )
+        await msg.reply_html(
+            "⛔ <b>Este canal ya está registrado.</b>\n\n"
+            "La verificación manual no cambia al propietario. Si hubo un cambio legítimo de responsable, "
+            "un administrador del bot debe usar la transferencia de canal."
+        )
+        for admin_id in settings.admin_ids:
+            await safe_dm(
+                context.bot,
+                admin_id,
+                "🧩 <b>Conflicto de propiedad en verificación manual</b>\n\n"
+                f"Canal: <code>{chat_id}</code>\n"
+                f"Propietario registrado: <code>{existing.get('owner_user_id')}</code>\n"
+                f"Intento desde: <code>{user.id}</code>",
+                parse_mode="HTML",
+            )
+        return
+
+    try:
+        bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
+    except TelegramError as exc:
+        await msg.reply_html(
+            "❌ <b>No puedo acceder a ese canal.</b>\n\n"
+            "Confirma que el bot siga dentro del canal y vuelve a intentarlo.\n\n"
+            f"<code>{html.escape(str(exc))}</code>"
+        )
+        return
+
+    if bot_member.status != ChatMemberStatus.ADMINISTRATOR:
+        await msg.reply_html(
+            "⚠️ <b>El bot está en el canal, pero no figura como administrador.</b>\n\n"
+            "Dale rol de administrador y vuelve a pulsar <b>Verificar manualmente</b>."
+        )
+        return
+
+    missing = required_channel_permissions(bot_member)
+
+    # getChatMember para otros usuarios está garantizado cuando el bot es admin.
+    try:
+        requester_member = await context.bot.get_chat_member(chat_id, user.id)
+    except TelegramError as exc:
+        await msg.reply_html(
+            "❌ No pude confirmar que tu cuenta administre ese canal.\n\n"
+            f"<code>{html.escape(str(exc))}</code>"
+        )
+        return
+
+    if requester_member.status not in {ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR} and not is_admin(user.id):
+        await msg.reply_html(
+            "⛔ <b>No puedo vincular ese canal a tu cuenta.</b>\n\n"
+            "Tu usuario debe aparecer como propietario o administrador del canal."
+        )
+        return
+
+    try:
+        info = await context.bot.get_chat(chat_id)
+        count = await context.bot.get_chat_member_count(chat_id)
+    except TelegramError as exc:
+        await msg.reply_html(
+            "❌ Telegram compartió el canal, pero no pude leer sus datos.\n\n"
+            f"<code>{html.escape(str(exc))}</code>"
+        )
+        return
+
+    category = category_from_members(count, settings.min_members)
+    was_registered = bool(existing)
+    old_status = existing.get("status") if existing else None
+
+    db.upsert_channel(
+        chat_id,
+        info.title or getattr(shared, "title", None) or str(chat_id),
+        info.username or getattr(shared, "username", None),
+        existing.get("owner_user_id") if existing and existing.get("owner_user_id") else user.id,
+        count,
+        category,
+    )
+    db.set_channel_permission_state(chat_id, not missing, "; ".join(missing) if missing else None)
+
+    if missing:
+        # El canal queda registrado para no perderlo, pero no puede publicarse todavía.
+        new_status = "permission_suspended" if old_status == "approved" else "configuring"
+        db.set_channel_fields(chat_id, status=new_status)
+        await msg.reply_html(
+            "⚠️ <b>Canal encontrado, pero faltan permisos.</b>\n\n"
+            f"<b>{html.escape(info.title or str(chat_id))}</b>\n"
+            f"ID: <code>{chat_id}</code>\n"
+            "Faltan:\n• " + "\n• ".join(map(html.escape, missing)) +
+            "\n\nCorrige esos permisos y vuelve a verificar el canal."
+        )
+        return
+
+    # Si ya tenía una configuración completa, la verificación no obliga a repetir
+    # el onboarding. Puede incluso recuperar automáticamente una suspensión causada
+    # exclusivamente por permisos faltantes.
+    complete_config = bool(existing and existing.get("button_title") and existing.get("invite_url"))
+    if was_registered and complete_config and old_status in {"approved", "permission_suspended"}:
+        db.set_channel_fields(chat_id, status="approved")
+        if existing.get("category") in CATEGORIES:
+            await publisher.refresh_category(context.bot, existing["category"])
+        db.log_system_event("manual_channel_verified", f"chat_id={chat_id}; user_id={user.id}; restored_approved=1")
+        await msg.reply_html(
+            "✅ <b>Canal verificado correctamente.</b>\n\n"
+            f"{html.escape(info.title or str(chat_id))}\n"
+            f"Miembros: <b>{count:,}</b>\n"
+            f"Categoría: <b>{html.escape(category)}</b>\n\n"
+            "La configuración existente se conservó y el canal está listo para participar.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📡 Ver mis canales", callback_data="user:channels")]]),
+        )
+        return
+
+    if was_registered and complete_config and old_status == "pending_review":
+        db.set_channel_fields(chat_id, status="pending_review")
+        db.log_system_event("manual_channel_verified", f"chat_id={chat_id}; user_id={user.id}; pending_review=1")
+        await msg.reply_html(
+            "✅ <b>Canal verificado correctamente.</b>\n\n"
+            "Tu configuración ya está completa y continúa <b>pendiente de revisión administrativa</b>.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📡 Ver mis canales", callback_data="user:channels")]]),
+        )
+        return
+
+    db.set_channel_fields(chat_id, status="configuring")
+    db.log_system_event("manual_channel_verified", f"chat_id={chat_id}; user_id={user.id}; recovered=1")
+    await msg.reply_html(
+        "✅ <b>Canal verificado manualmente.</b>\n\n"
+        f"{html.escape(info.title or str(chat_id))}\n"
+        f"Miembros: <b>{count:,}</b>\n"
+        f"Categoría: <b>{html.escape(category)}</b>\n\n"
+        "Ahora selecciona cómo deberá comportarse el enlace del botón:",
+        reply_markup=link_type_keyboard(chat_id),
+    )
+
+
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     event = update.my_chat_member
     if not event or event.chat.type != ChatType.CHANNEL:
@@ -303,13 +531,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Cambio de permisos de un bot que ya era administrador. La suspensión por
         # permisos NO suma una falta y se revierte automáticamente al restaurarlos.
         if existing:
-            required = (
-                ("can_post_messages", "publicar mensajes"),
-                ("can_edit_messages", "editar mensajes"),
-                ("can_delete_messages", "eliminar mensajes"),
-                ("can_invite_users", "invitar usuarios / crear enlaces"),
-            )
-            missing = [label for attr, label in required if not bool(getattr(new, attr, False))]
+            missing = required_channel_permissions(new)
             db.set_channel_permission_state(chat.id, not missing, "; ".join(missing) if missing else None)
             if missing and existing.get("status") == "approved":
                 db.set_channel_fields(chat.id, status="permission_suspended")
@@ -331,7 +553,10 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "✅ <b>Permisos restaurados.</b> Tu canal vuelve a participar automáticamente.",
                     parse_mode="HTML",
                 )
-        return
+            return
+        # Si no existe en la base pero Telegram informa un cambio de permisos de un
+        # bot que ya era admin, aprovechamos el evento para recuperar el alta en vez
+        # de descartarlo. Esto cubre parte de los casos donde se perdió el evento inicial.
 
     if not new_is_admin:
         # Evita contabilizar como otra falta cuando el propio bot abandona un canal
@@ -427,15 +652,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.upsert_channel(chat.id, info.title or str(chat.id), info.username, owner_id, count, category)
     db.set_channel_fields(chat.id, status="configuring")
 
-    missing = []
-    for attr, label in (
-        ("can_post_messages", "Publicar mensajes"),
-        ("can_edit_messages", "Editar mensajes"),
-        ("can_delete_messages", "Eliminar mensajes"),
-        ("can_invite_users", "Invitar usuarios"),
-    ):
-        if not getattr(new, attr, False):
-            missing.append(label)
+    missing = required_channel_permissions(new)
     db.set_channel_permission_state(chat.id, not missing, "; ".join(missing) if missing else None)
     warning = ""
     if missing:
@@ -448,7 +665,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>{html.escape(info.title or str(chat.id))}</b>\n"
         f"Miembros: <b>{count:,}</b>\n"
         f"Categoría: <b>{html.escape(category)}</b>\n\n"
-        "Selecciona el tipo de enlace del botón:" + warning,
+        "Selecciona si el enlace permitirá ingreso directo o requerirá aprobación:" + warning,
         parse_mode="HTML",
         reply_markup=link_type_keyboard(chat.id),
     )
@@ -470,23 +687,29 @@ async def config_link_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await q.answer("No tienes permiso.", show_alert=True)
         return
 
+    if kind not in {"direct", "approval"}:
+        await q.answer("Tipo de ingreso inválido.", show_alert=True)
+        return
+
     try:
-        chat = await context.bot.get_chat(chat_id)
-        if kind == "public":
-            if not chat.username:
-                await q.message.reply_html(
-                    "⚠️ El canal no tiene <b>@username público</b>. Configúralo en Telegram o elige privado.",
-                    reply_markup=link_type_keyboard(chat_id),
-                )
-                return
-            invite_url = f"https://t.me/{chat.username}"
-        else:
-            link = await context.bot.create_chat_invite_link(
-                chat_id=chat_id,
-                name="Botonera",
-                creates_join_request=False,
-            )
-            invite_url = link.invite_link
+        # Siempre generamos un enlace administrado por el bot. Así el comportamiento
+        # elegido es independiente de que el canal tenga o no @username público.
+        # En modo approval Telegram crea una solicitud que debe aprobar un admin.
+        previous_url = ch.get("invite_url")
+        if previous_url and ("t.me/+" in previous_url or "t.me/joinchat/" in previous_url):
+            try:
+                await context.bot.revoke_chat_invite_link(chat_id=chat_id, invite_link=previous_url)
+            except TelegramError:
+                # Puede ser un enlace antiguo creado por otro administrador. No impide
+                # generar el enlace nuevo que usará la botonera.
+                pass
+
+        link = await context.bot.create_chat_invite_link(
+            chat_id=chat_id,
+            name="Botonera - Solicitud" if kind == "approval" else "Botonera - Directo",
+            creates_join_request=(kind == "approval"),
+        )
+        invite_url = link.invite_link
 
         db.set_channel_fields(chat_id, invite_type=kind, invite_url=invite_url)
         ch = db.get_channel(chat_id)
@@ -539,7 +762,7 @@ async def owner_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "color":
         await q.message.reply_html("🎨 Elige el color:", reply_markup=color_keyboard(chat_id))
     elif action == "link":
-        await q.message.reply_html("🔗 Elige el tipo de enlace:", reply_markup=link_type_keyboard(chat_id))
+        await q.message.reply_html("🔗 Elige cómo será el ingreso mediante el botón:", reply_markup=link_type_keyboard(chat_id))
     elif action == "reactivate":
         try:
             member = await context.bot.get_chat_member(chat_id, context.bot.id)
@@ -627,7 +850,7 @@ async def participant_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             + f"Estado: <b>{html.escape(ch.get('status') or '—')}</b>\n"
             f"🔘 Botón: <b>{html.escape(ch.get('button_title') or '—')}</b>\n"
             f"🎨 Color: <b>{html.escape(ch.get('button_style') or 'default')}</b>\n"
-            f"🔗 Enlace: <b>{html.escape(ch.get('invite_type') or '—')}</b>\n"
+            f"🔗 Ingreso: <b>{html.escape(invite_mode_label(ch.get('invite_type')))}</b>\n"
             f"🕐 Próxima botonera: <b>{html.escape(next_text)}</b>"
         )
         await q.edit_message_text(text, parse_mode="HTML", reply_markup=participant_channel_keyboard(chat_id, ch.get("status") or ""))
@@ -768,11 +991,20 @@ async def participant_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         me = await context.bot.get_me()
         body = (
             "➕ <b>Agregar canal</b>\n\n"
-            "1. Pulsa el botón inferior.\n2. Selecciona el canal.\n3. Confirma que el bot sea administrador.\n\n"
-            "Permisos solicitados: publicar, editar, eliminar mensajes e invitar usuarios.\n"
-            "Después de agregarme, recibirás aquí el asistente para enlace, título y color."
+            "1. Pulsa <b>Agregar bot a un canal</b>.\n"
+            "2. Selecciona el canal y concede los permisos solicitados.\n"
+            "3. Normalmente el alta se detectará automáticamente.\n\n"
+            "Si el bot <b>ya aparece como administrador</b> pero no recibiste la confirmación, "
+            "pulsa <b>Ya lo agregué · Verificar manualmente</b>. El sistema consultará el canal directamente con Telegram.\n\n"
+            "Permisos requeridos: publicar, editar, eliminar mensajes e invitar usuarios."
         )
         await q.edit_message_text(body, parse_mode="HTML", reply_markup=participant_add_channel_keyboard(me.username))
+        return
+    if data == "user:verifychannel":
+        if db.is_banned(user_id) and not is_admin(user_id):
+            await q.answer("Tu cuenta está bloqueada.", show_alert=True)
+            return
+        await send_manual_channel_verification(q.message)
         return
     if data.startswith("user:withdrawask:"):
         chat_id = int(data.split(":", 2)[2])
@@ -814,6 +1046,8 @@ async def participant_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await q.edit_message_text(
             "ℹ️ <b>Ayuda del participante</b>\n\n"
             "• Agrega el bot como administrador desde ➕ Agregar canal.\n"
+            "• Si no llega la confirmación automática, usa ✅ Verificar manualmente o /verificarcanal.\n"
+            "• El enlace puede ser de ingreso directo o de solicitud para aprobación.\n"
             "• Cada alta o modificación pasa por revisión.\n"
             "• Tus estadísticas comparan suscriptores al inicio y al cierre.\n"
             "• Las categorías se actualizan automáticamente.\n"
@@ -2198,6 +2432,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler(["miscanales", "miscanais"], my_channels))
+    app.add_handler(CommandHandler("verificarcanal", verify_channel_command))
     app.add_handler(CommandHandler(["miperfil", "inicio"], start))
     app.add_handler(CommandHandler("panel", panel))
     app.add_handler(CommandHandler("pendientes", pending_command))
@@ -2240,6 +2475,7 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(sanction_callback, pattern=r"^sanction:"))
     app.add_handler(CallbackQueryHandler(appeal_admin_callback, pattern=r"^appeal:"))
 
+    app.add_handler(MessageHandler(filters.StatusUpdate.CHAT_SHARED & filters.ChatType.PRIVATE, manual_chat_shared))
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, photo_input))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, text_input))
     app.add_error_handler(error_handler)

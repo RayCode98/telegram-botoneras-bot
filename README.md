@@ -1,4 +1,4 @@
-# Telegram Botoneras v6
+# Telegram Botoneras v6.1
 
 Bot en Python para administrar publicaciones programadas de intercambio de canales de Telegram con categorías, revisión, estadísticas, mezcla periódica, sanciones, panel de participantes y herramientas de robustez/operación.
 
@@ -73,6 +73,7 @@ El panel incluye:
 - 📡 Mis canales
 - 📊 Estadísticas
 - ➕ Agregar canal
+- ✅ Verificación manual de un canal cuando el alta automática no llega
 - 🕐 Próximas botoneras
 - ⚠️ Mi estado
 - 🔔 Notificaciones
@@ -85,10 +86,11 @@ Los administradores también ven un botón para entrar al panel administrativo.
 1. El usuario debe haber iniciado el bot con `/start`.
 2. En `➕ Agregar canal`, pulsa `Agregar bot a un canal`.
 3. Telegram abre el selector de canales y solicita los permisos necesarios.
-4. Al convertirse el bot en administrador, `my_chat_member` registra el canal y al responsable.
-5. El participante elige enlace público/privado, título y color.
-6. La solicitud pasa a revisión.
-7. Al aprobarse, el botón entra en su categoría.
+4. Al convertirse el bot en administrador, `my_chat_member` intenta registrar el canal y al responsable automáticamente.
+5. Si esa actualización no llega o se perdió, el usuario puede pulsar **Ya lo agregué · Verificar manualmente** o ejecutar `/verificarcanal`. Telegram abre su selector nativo de canales y el bot vuelve a comprobar directamente el `chat_id`, al usuario administrador y sus propios permisos.
+6. El participante elige ingreso directo/solicitud de ingreso, título y color.
+7. La solicitud pasa a revisión.
+8. Al aprobarse, el botón entra en su categoría.
 
 ### Edición
 
@@ -308,3 +310,42 @@ requirements.txt
 CHANGELOG_v6.md
 README.md
 ```
+
+
+## v6.1 — Enlaces de ingreso y verificación manual
+
+### Ingreso directo vs solicitud de ingreso
+
+La configuración de enlace ya no significa público/privado. Ahora significa:
+
+- **🚪 Ingreso directo**: `creates_join_request=False`. Quien pulse el botón puede entrar mediante ese enlace sin aprobación previa.
+- **🛂 Solicitud de ingreso**: `creates_join_request=True`. Quien pulse el botón genera una solicitud que debe ser aprobada por un administrador del canal.
+
+El bot genera un enlace de invitación propio en ambos casos. Para hacerlo necesita el permiso **Invitar usuarios**.
+
+> Nota: si el canal tiene un `@username` público, seguirá existiendo la posibilidad de encontrar/abrir el canal mediante ese enlace público fuera de la botonera. El enlace generado por el bot sí respetará el modo elegido. Para exigir aprobación como única vía de entrada, el canal debe ser privado en Telegram.
+
+### Recuperar un canal que no fue detectado
+
+Si el bot aparece como administrador pero nunca llegó el mensaje de confirmación:
+
+1. Abre el bot en privado.
+2. Entra a `➕ Agregar canal`.
+3. Pulsa `✅ Ya lo agregué · Verificar manualmente`.
+4. Telegram mostrará el selector nativo de canales.
+5. Selecciona el canal.
+6. El bot comprueba en tiempo real:
+   - que el chat sea un canal;
+   - que el bot sea administrador;
+   - que tenga publicar, editar, eliminar e invitar;
+   - que el usuario que lo está verificando sea propietario/administrador;
+   - que el canal no pertenezca ya a otro participante.
+7. Si todo está correcto, continúa con ingreso directo/solicitud, título, color y revisión administrativa.
+
+También puede abrirse directamente con:
+
+```text
+/verificarcanal
+```
+
+Esta vía no depende de recibir de nuevo `my_chat_member`, por lo que sirve para canales que ya tenían al bot como administrador antes de que el sistema registrara correctamente el alta.

@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    ChatAdministratorRights,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    KeyboardButtonRequestChat,
+    ReplyKeyboardMarkup,
+)
 
 from .config import BUTTON_STYLES, CATEGORIES
 
@@ -25,10 +32,82 @@ def rows_one(buttons: list[InlineKeyboardButton]) -> InlineKeyboardMarkup:
 
 
 def link_type_keyboard(chat_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🌐 Público", callback_data=f"cfg_link:public:{chat_id}", style="primary"),
-        InlineKeyboardButton("🔐 Privado", callback_data=f"cfg_link:private:{chat_id}", style="success"),
-    ]])
+    """Selecciona el comportamiento del enlace, no la visibilidad del canal."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "🚪 Ingreso directo",
+            callback_data=f"cfg_link:direct:{chat_id}",
+            style="success",
+        )],
+        [InlineKeyboardButton(
+            "🛂 Solicitud de ingreso",
+            callback_data=f"cfg_link:approval:{chat_id}",
+            style="primary",
+        )],
+    ])
+
+
+def manual_channel_verification_keyboard(request_id: int = 61001) -> ReplyKeyboardMarkup:
+    """Selector nativo de Telegram para recuperar/verificar un canal manualmente.
+
+    El selector limita la elección a canales donde el usuario tenga capacidad de
+    promover administradores y solicita para el bot los permisos que necesita el
+    sistema de botoneras. La verificación real se repite del lado del bot cuando
+    Telegram devuelve ``chat_shared``.
+    """
+    user_rights = ChatAdministratorRights(
+        is_anonymous=False,
+        can_manage_chat=True,
+        can_delete_messages=True,
+        can_manage_video_chats=False,
+        can_restrict_members=False,
+        can_promote_members=True,
+        can_change_info=False,
+        can_invite_users=True,
+        can_post_stories=False,
+        can_edit_stories=False,
+        can_delete_stories=False,
+        can_post_messages=True,
+        can_edit_messages=True,
+        can_pin_messages=False,
+        can_manage_topics=False,
+        can_manage_direct_messages=False,
+        can_manage_tags=False,
+    )
+    bot_rights = ChatAdministratorRights(
+        is_anonymous=False,
+        can_manage_chat=True,
+        can_delete_messages=True,
+        can_manage_video_chats=False,
+        can_restrict_members=False,
+        can_promote_members=False,
+        can_change_info=False,
+        can_invite_users=True,
+        can_post_stories=False,
+        can_edit_stories=False,
+        can_delete_stories=False,
+        can_post_messages=True,
+        can_edit_messages=True,
+        can_pin_messages=False,
+        can_manage_topics=False,
+        can_manage_direct_messages=False,
+        can_manage_tags=False,
+    )
+    request = KeyboardButtonRequestChat(
+        request_id=request_id,
+        chat_is_channel=True,
+        user_administrator_rights=user_rights,
+        bot_administrator_rights=bot_rights,
+        bot_is_member=True,
+        request_title=True,
+        request_username=True,
+    )
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("✅ Seleccionar / verificar canal", request_chat=request)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+        input_field_placeholder="Selecciona el canal que deseas verificar",
+    )
 
 
 def color_keyboard(chat_id: int) -> InlineKeyboardMarkup:
@@ -58,10 +137,12 @@ def owner_channel_keyboard(chat_id: int, status: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("✏️ Título", callback_data=f"owner:title:{chat_id}"),
             InlineKeyboardButton("🎨 Color", callback_data=f"owner:color:{chat_id}"),
         ],
-        [InlineKeyboardButton("🔗 Tipo de enlace", callback_data=f"owner:link:{chat_id}")],
+        [InlineKeyboardButton("🔗 Tipo de ingreso", callback_data=f"owner:link:{chat_id}")],
     ]
     if status in {"suspended", "inactive", "rejected", "withdrawn", "below_minimum"}:
         rows.append([InlineKeyboardButton("🔁 Solicitar reactivación", callback_data=f"owner:reactivate:{chat_id}", style="primary")])
+    if status in {"configuring", "inactive", "permission_suspended"}:
+        rows.append([InlineKeyboardButton("✅ Verificar con Telegram", callback_data="user:verifychannel", style="success")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -219,6 +300,8 @@ def participant_channel_keyboard(chat_id: int, status: str) -> InlineKeyboardMar
         rows.append([InlineKeyboardButton("🚪 Retirar canal", callback_data=f"user:withdrawask:{chat_id}", style="danger")])
     elif status in {"withdrawn", "suspended", "permission_suspended", "inactive", "rejected", "below_minimum"}:
         rows.append([InlineKeyboardButton("♻️ Solicitar reactivación", callback_data=f"owner:reactivate:{chat_id}", style="primary")])
+    if status in {"configuring", "inactive", "permission_suspended"}:
+        rows.append([InlineKeyboardButton("✅ Verificar con Telegram", callback_data="user:verifychannel", style="success")])
     rows.append([InlineKeyboardButton("⬅️ Mis canales", callback_data="user:channels")])
     return InlineKeyboardMarkup(rows)
 
@@ -265,7 +348,11 @@ def participant_withdraw_confirm_keyboard(chat_id: int) -> InlineKeyboardMarkup:
 def participant_add_channel_keyboard(bot_username: str) -> InlineKeyboardMarkup:
     rights = "post_messages+edit_messages+delete_messages+invite_users"
     url = f"https://t.me/{bot_username}?startchannel&admin={rights}"
-    return InlineKeyboardMarkup([[InlineKeyboardButton("➕ Agregar bot a un canal", url=url, style="success")], [InlineKeyboardButton("⬅️ Inicio", callback_data="user:home")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Agregar bot a un canal", url=url, style="success")],
+        [InlineKeyboardButton("✅ Ya lo agregué · Verificar manualmente", callback_data="user:verifychannel", style="primary")],
+        [InlineKeyboardButton("⬅️ Inicio", callback_data="user:home")],
+    ])
 
 
 def appeal_admin_keyboard(appeal_id: int) -> InlineKeyboardMarkup:

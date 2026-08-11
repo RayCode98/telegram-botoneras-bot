@@ -245,6 +245,13 @@ class Database:
         self._ensure_column("channels", "permission_checked_at", "TEXT")
         self._ensure_column("channels", "owner_bound_at", "TEXT")
         with self.connection() as conn:
+            # v6.1: antes la interfaz llamaba "público/privado" al tipo de enlace.
+            # Ambos modos antiguos permitían ingreso directo, por lo que se migran
+            # al nuevo nombre semántico. El propietario puede cambiar después a
+            # "approval" desde su panel.
+            conn.execute(
+                "UPDATE channels SET invite_type='direct' WHERE invite_type IN ('public','private')"
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_board_messages_live ON board_messages(category, active, expires_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_board_messages_chat ON board_messages(destination_chat_id, active)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_board_stats_pending ON board_messages(stats_sent_at, end_member_count)")
