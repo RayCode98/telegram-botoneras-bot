@@ -107,8 +107,23 @@ class Publisher:
     # ------------------------------------------------------------------
     # Markup / shuffle
     # ------------------------------------------------------------------
-    def _channel_buttons(self, category: str) -> list:
+    def _channel_buttons(self, category: str, campaign_id: int | None = None) -> list:
         buttons = []
+        if campaign_id is not None:
+            rows = self.db.campaign_button_channels(int(campaign_id))
+            for ch in rows:
+                if ch.get("invite_link"):
+                    buttons.append(
+                        url_button(
+                            ch.get("button_title") or ch.get("telegram_title") or str(ch["chat_id"]),
+                            ch["invite_link"],
+                            ch.get("button_style") or "default",
+                        )
+                    )
+            return buttons
+
+        # Vista previa / compatibilidad: fuera de una campaña se usa el enlace
+        # configurado del canal. Las publicaciones reales v6.2 usan campaign_id.
         for ch in self.db.approved_channels(category):
             if ch.get("invite_url"):
                 buttons.append(
@@ -131,10 +146,11 @@ class Publisher:
         self,
         category: str,
         *,
+        campaign_id: int | None = None,
         shuffle_channels: bool = False,
         shuffle_seed: int | None = None,
     ) -> InlineKeyboardMarkup:
-        channel_buttons = self._channel_buttons(category)
+        channel_buttons = self._channel_buttons(category, campaign_id=campaign_id)
 
         if shuffle_seed is not None:
             random.Random(int(shuffle_seed)).shuffle(channel_buttons)
@@ -156,6 +172,7 @@ class Publisher:
     def markup_for_row(self, row: dict) -> InlineKeyboardMarkup:
         return self.build_markup(
             row["category"],
+            campaign_id=row.get("campaign_id"),
             shuffle_seed=row.get("shuffle_seed"),
         )
 
@@ -178,7 +195,7 @@ class Publisher:
                 await bot.edit_message_reply_markup(
                     chat_id=row["destination_chat_id"],
                     message_id=row["message_id"],
-                    reply_markup=self.build_markup(category, shuffle_seed=seed),
+                    reply_markup=self.build_markup(category, campaign_id=row.get("campaign_id"), shuffle_seed=seed),
                 )
                 self.db.set_board_shuffle_seed(row["id"], seed)
                 self.db.mark_board_checked(row["id"])
@@ -365,9 +382,110 @@ class Publisher:
         self.db.mark_stats_sent(row["id"])
         return True
 
+    async def _send_campaign_stats_message(self, bot, row: dict) -> bool:
+        owner_id = row.get("owner_user_id")
+        if not owner_id:
+            self.db.note_campaign_stats_attempt(row["id"], "Canal sin responsable registrado")
+            return False
+        user = self.db.get_user(int(owner_id))
+        if not user:
+            self.db.note_campaign_stats_attempt(row["id"], "El propietario todavía no inició /start")
+            return False
+        prefs = self.db.get_user_preferences(int(owner_id))
+        if not bool(prefs.get("notify_stats", 1)):
+            self.db.mark_campaign_stats_sent(row["id"])
+            return True
+
+        start = row.get("start_member_count")
+        end_count = row.get("end_member_count")
+        delta = row.get("member_delta")
+        if start is None or end_count is None or delta is None:
+            return False
+
+        requests = int(row.get("requests_count") or 0)
+        request_events = int(row.get("request_events") or 0)
+        joined = int(row.get("joined_count") or 0)
+        left = int(row.get("left_count") or 0)
+        mode = row.get("entry_mode") or "direct"
+        campaign_id = int(row.get("campaign_id") or 0)
+
+        if delta > 0:
+            net_text = f"📈 <b>+{int(delta):,}</b>"
+        elif delta < 0:
+            net_text = f"📉 <b>{int(delta):,}</b>"
+        else:
+            net_text = "➖ <b>0</b>"
+
+        lines = [
+            f"📊 <b>Resultados · Campaña #{campaign_id}</b>",
+            "",
+            f"Canal: <b>{html.escape(row.get('telegram_title') or str(row['chat_id']))}</b>",
+            f"Categoría: <b>{html.escape(row.get('category') or '—')}</b>",
+            "",
+        ]
+        if mode == "approval":
+            unconfirmed = max(0, requests - joined)
+            conversion = (joined / requests * 100.0) if requests else 0.0
+            lines.extend([
+                "🛂 <b>Solicitudes de ingreso</b>",
+                f"Solicitudes únicas atribuidas: <b>{requests:,}</b>",
+                f"Ingresos confirmados: <b>{joined:,}</b>",
+                f"Sin ingreso confirmado: <b>{unconfirmed:,}</b>",
+                f"Conversión solicitud → ingreso: <b>{conversion:.1f}%</b>",
+            ])
+            if request_events > requests:
+                lines.append(f"Intentos totales de solicitud: <b>{request_events:,}</b>")
+        else:
+            lines.extend([
+                "🚪 <b>Ingreso directo</b>",
+                f"Ingresos atribuidos al enlace de campaña: <b>{joined:,}</b>",
+            ])
+
+        if left:
+            lines.append(f"Salidas detectadas entre los ingresos atribuidos: <b>{left:,}</b>")
+
+        lines.extend([
+            "",
+            "👥 <b>Crecimiento neto del canal</b>",
+            f"Al iniciar: <b>{int(start):,}</b>",
+            f"Al finalizar: <b>{int(end_count):,}</b>",
+            f"Diferencia neta: {net_text}",
+        ])
+
+        current_category = row.get("channel_category_current") or "—"
+        pending = row.get("pending_category")
+        lines.append("")
+        lines.append(f"Categoría actual: <b>{html.escape(str(current_category))}</b>")
+        if pending and pending != current_category:
+            lines.append(f"Próxima categoría: <b>{html.escape(str(pending))}</b> 🔄")
+
+        lines.extend([
+            "",
+            "ℹ️ Las solicitudes/ingresos se atribuyen al enlace exclusivo de esta campaña. "
+            "El crecimiento neto puede diferir porque también existen bajas y otras fuentes de tráfico.",
+        ])
+
+        self.db.note_campaign_stats_attempt(row["id"], None)
+        try:
+            await bot.send_message(chat_id=user["private_chat_id"], text="\n".join(lines), parse_mode="HTML")
+        except (Forbidden, BadRequest, TelegramError) as exc:
+            self.db.note_campaign_stats_attempt(row["id"], str(exc)[:300])
+            return False
+        self.db.mark_campaign_stats_sent(row["id"])
+        return True
+
     async def retry_pending_stats(self, bot, limit: int = 100) -> dict:
         sent = failed = 0
-        for row in self.db.pending_stats_messages(limit=limit):
+        # Estadísticas v6.2 por campaña.
+        for row in self.db.pending_campaign_stats(limit=limit):
+            if await self._send_campaign_stats_message(bot, row):
+                sent += 1
+            else:
+                failed += 1
+        # Historial heredado v6.1 sin campaign_id.
+        for row in self.db.pending_stats_messages(limit=max(0, limit - sent - failed)):
+            if row.get("campaign_id") is not None:
+                continue
             if await self._send_stats_message(bot, row):
                 sent += 1
             else:
@@ -375,6 +493,10 @@ class Publisher:
         return {"sent": sent, "failed": failed}
 
     async def _finalize_board_completion(self, bot, row: dict):
+        # Desde v6.2 las publicaciones que pertenecen a una campaña se reportan
+        # una sola vez desde campaign_channels, no una vez por copia distribuida.
+        if row.get("campaign_id") is not None:
+            return
         if row.get("removal_reason") not in STATS_REMOVAL_REASONS:
             return
 
@@ -396,6 +518,125 @@ class Publisher:
         fresh = self.db.get_board_message(row["id"]) or row
         await self._send_finished_notice(bot, channel, fresh)
         await self._send_stats_message(bot, fresh)
+
+    # ------------------------------------------------------------------
+    # Campaign links & attribution (v6.2)
+    # ------------------------------------------------------------------
+    async def _create_campaign_link(self, bot, campaign_id: int, channel: dict, expires_dt: datetime) -> dict | None:
+        chat_id = int(channel["chat_id"])
+        if self.permission_validator is not None:
+            ok, _issues = await self.permission_validator(bot, channel)
+            if not ok:
+                return None
+            channel = self.db.get_channel(chat_id) or channel
+        if channel.get("status") != "approved":
+            return None
+
+        start_count = await self._member_count(bot, chat_id, int(channel.get("member_count") or 0))
+        if start_count is not None:
+            self.db.set_channel_fields(chat_id, member_count=start_count)
+        mode = "approval" if channel.get("invite_type") == "approval" else "direct"
+        short = abs(chat_id) % 1000000
+        name = f"B{campaign_id}-{channel.get('category') or 'CAT'}-{short}"[:32]
+        try:
+            link = await bot.create_chat_invite_link(
+                chat_id=chat_id,
+                name=name,
+                expire_date=expires_dt,
+                creates_join_request=(mode == "approval"),
+            )
+            self.db.add_campaign_channel(
+                campaign_id, chat_id, mode, link.invite_link, name, start_count, None,
+            )
+            return self.db.campaign_channel(campaign_id, chat_id)
+        except TelegramError as exc:
+            self.db.add_campaign_channel(
+                campaign_id, chat_id, mode, None, name, start_count, str(exc)[:300],
+            )
+            log.warning("No se pudo crear enlace de campaña #%s para %s: %s", campaign_id, chat_id, exc)
+            return None
+
+    async def _prepare_campaign(self, bot, category: str, now: datetime, expires_dt: datetime) -> int:
+        campaign_id = self.db.create_campaign(
+            category,
+            now.isoformat(timespec="seconds"),
+            expires_dt.isoformat(timespec="seconds"),
+        )
+        # Los enlaces pertenecen solo a los canales que forman los botones de esta categoría.
+        for channel in list(self.db.publication_candidates(category)):
+            await self._create_campaign_link(bot, campaign_id, channel, expires_dt)
+        return campaign_id
+
+    async def _revoke_campaign_links(self, bot, campaign_id: int):
+        for row in self.db.campaign_channels(campaign_id):
+            link = row.get("invite_link")
+            if not link or row.get("link_revoked_at"):
+                continue
+            try:
+                await bot.revoke_chat_invite_link(chat_id=row["chat_id"], invite_link=link)
+                self.db.mark_campaign_link_revoked(campaign_id, row["chat_id"])
+            except TelegramError as exc:
+                # El expire_date sigue siendo la segunda barrera. Guardamos el error
+                # para diagnóstico (p.ej. si el bot fue eliminado del canal).
+                self.db.mark_campaign_link_revoked(campaign_id, row["chat_id"], str(exc)[:300])
+                log.warning("No se pudo revocar enlace campaña #%s chat %s: %s", campaign_id, row["chat_id"], exc)
+
+    async def _close_campaign(self, bot, campaign_id: int, reason: str) -> dict:
+        campaign = self.db.get_campaign(campaign_id)
+        if not campaign or campaign.get("status") != "active":
+            return {"closed": False, "channels": 0}
+
+        # Primero revocamos. Para solicitudes, esto corta la atribución de la campaña
+        # aunque alguna copia del post tarde en borrarse.
+        await self._revoke_campaign_links(bot, campaign_id)
+
+        finalized = 0
+        for row in self.db.campaign_channels(campaign_id):
+            if not row.get("invite_link"):
+                continue
+            channel = self.db.get_channel(row["chat_id"])
+            fallback = row.get("start_member_count")
+            if channel:
+                fallback = int(channel.get("member_count") or fallback or 0)
+            end_count = await self._member_count(bot, row["chat_id"], fallback)
+            start_count = row.get("start_member_count")
+            delta = None
+            if end_count is not None and start_count is not None:
+                delta = int(end_count) - int(start_count)
+            self.db.finalize_campaign_channel(campaign_id, row["chat_id"], end_count, delta)
+            if channel and end_count is not None:
+                self._queue_category_change(channel, end_count)
+            finalized += 1
+
+        self.db.close_campaign(campaign_id, reason)
+
+        # Aviso de cierre y estadísticas, una vez por canal/botón de la campaña.
+        # Si nunca se publicó ninguna copia, cerramos silenciosamente.
+        if reason == "publish_failed":
+            return {"closed": True, "channels": finalized}
+
+        for row in self.db.campaign_channels(campaign_id):
+            if not row.get("invite_link"):
+                continue
+            channel = self.db.get_channel(row["chat_id"])
+            if channel:
+                end_count = row.get("end_member_count")
+                text = (
+                    f"🏁 <b>Botonera finalizada · Campaña #{campaign_id}</b>\n\n"
+                    f"Canal: <b>{html.escape(channel.get('telegram_title') or str(channel['chat_id']))}</b>\n"
+                    f"Categoría: <b>{html.escape(campaign.get('category') or '—')}</b>\n"
+                    + (f"Suscriptores al cierre: <b>{int(end_count):,}</b>\n" if end_count is not None else "")
+                    + "El enlace de esta campaña ya fue revocado/expirado."
+                )
+                await self._notify_owner(bot, channel, "notify_board_finished", text)
+            fresh = self.db.campaign_stats_row(row["id"])
+            if fresh:
+                await self._send_campaign_stats_message(bot, fresh)
+        return {"closed": True, "channels": finalized}
+
+    async def _close_active_campaigns_for_category(self, bot, category: str, reason: str):
+        for campaign in list(self.db.active_campaigns(category)):
+            await self._close_campaign(bot, int(campaign["id"]), reason)
 
     # ------------------------------------------------------------------
     # Delete / publish / refresh
@@ -444,7 +685,8 @@ class Publisher:
         attempts: int = 3,
     ) -> dict:
         initial = list(self.db.live_board_messages(category))
-        if not initial:
+        campaigns = list(self.db.active_campaigns(category))
+        if not initial and not campaigns:
             return {"total": 0, "deleted": 0, "failed": 0, "remaining": [], "category_changes": []}
 
         successful_ids: set[int] = set()
@@ -461,6 +703,10 @@ class Publisher:
                 await asyncio.sleep(0.75)
 
         remaining = list(self.db.live_board_messages(category))
+        # La intención de cierre manda: revocamos los enlaces y consolidamos las
+        # estadísticas aunque alguna copia no haya podido borrarse todavía.
+        for campaign in campaigns:
+            await self._close_campaign(bot, int(campaign["id"]), reason)
         changes = self.apply_pending_categories_if_safe()
         await self._notify_category_changes(bot, changes)
         return {
@@ -486,13 +732,24 @@ class Publisher:
         if not template or not template.get("photo_file_id"):
             return {"sent": 0, "failed": 0, "reason": "La plantilla no tiene imagen."}
 
-        # Aplica cambios de categoría pendientes solo si no alteran campañas activas.
+        # Si había una campaña de la misma categoría, terminarla antes de crear
+        # nuevos enlaces; así nunca conviven dos juegos de enlaces atribuidos.
+        if self.db.live_board_messages(category):
+            await self.delete_category_everywhere(bot, category, reason="replaced", attempts=3)
+        await self._close_active_campaigns_for_category(bot, category, "replaced")
+
         pre_changes = self.apply_pending_categories_if_safe()
         await self._notify_category_changes(bot, pre_changes)
 
         now = datetime.now(self.settings.timezone)
         today = now.date().isoformat()
-        expires_at = (now + timedelta(hours=self.lifetime_hours(category))).isoformat(timespec="seconds")
+        expires_dt = now + timedelta(hours=self.lifetime_hours(category))
+        expires_at = expires_dt.isoformat(timespec="seconds")
+        campaign_id = await self._prepare_campaign(bot, category, now, expires_dt)
+
+        # Si no se pudo crear ningún enlace de canal, los botones manuales aún pueden
+        # publicarse, pero lo dejamos registrado en el resultado.
+        campaign_buttons = self.db.campaign_button_channels(campaign_id)
         sent = failed = 0
 
         for channel in self.publication_candidates(category):
@@ -503,21 +760,14 @@ class Publisher:
                     if not ok:
                         failed += 1
                         continue
-                    # El validador puede haber reactivado el canal.
                     channel = self.db.get_channel(chat_id) or channel
-
-                await self.delete_active_for_category_destination(bot, category, chat_id, "replaced")
-
-                start_count = await self._member_count(bot, chat_id, int(channel.get("member_count") or 0))
-                if start_count is not None:
-                    self.db.set_channel_fields(chat_id, member_count=start_count)
 
                 seed = self.new_shuffle_seed() if self.shuffle_enabled(category) else None
                 msg = await bot.send_photo(
                     chat_id=chat_id,
                     photo=template["photo_file_id"],
                     caption=template.get("text") or None,
-                    reply_markup=self.build_markup(category, shuffle_seed=seed),
+                    reply_markup=self.build_markup(category, campaign_id=campaign_id, shuffle_seed=seed),
                     parse_mode="HTML",
                 )
                 self.db.add_board_message(
@@ -526,17 +776,36 @@ class Publisher:
                     msg.message_id,
                     today,
                     expires_at,
-                    start_member_count=start_count,
+                    start_member_count=None,
                     channel_category_start=channel.get("category"),
                     shuffle_seed=seed,
+                    campaign_id=campaign_id,
                 )
-                await self._send_started_notice(bot, channel, category, start_count, expires_at)
                 sent += 1
             except TelegramError as exc:
                 failed += 1
                 log.warning("No se pudo publicar %s en %s: %s", category, chat_id, exc)
 
-        return {"sent": sent, "failed": failed, "reason": None, "expires_at": expires_at}
+        if sent == 0:
+            # Sin publicaciones no existe campaña útil; cerramos y revocamos.
+            await self._close_campaign(bot, campaign_id, "publish_failed")
+            return {
+                "sent": 0, "failed": failed, "reason": "No se pudo publicar en ningún canal.",
+                "expires_at": expires_at, "campaign_id": campaign_id,
+            }
+
+        # Aviso de inicio una sola vez por canal promocionado.
+        for cc in self.db.campaign_channels(campaign_id):
+            channel = self.db.get_channel(cc["chat_id"])
+            if channel and cc.get("invite_link"):
+                await self._send_started_notice(
+                    bot, channel, category, cc.get("start_member_count"), expires_at,
+                )
+
+        return {
+            "sent": sent, "failed": failed, "reason": None, "expires_at": expires_at,
+            "campaign_id": campaign_id, "tracked_channels": len(campaign_buttons),
+        }
 
     async def refresh_category(self, bot, category: str) -> dict:
         edited = failed = missing = 0
@@ -599,19 +868,19 @@ class Publisher:
 
     async def publish_to_newly_approved_if_live(self, bot, category: str, chat_id: int):
         live_rows = self.db.live_board_messages(category)
-        if not live_rows:
+        campaigns = self.db.active_campaigns(category)
+        if not live_rows or not campaigns:
             return
-        if self.settings.distribute_mode == "category":
-            channel = self.db.get_channel(chat_id)
-            if not channel or channel.get("category") != category:
-                return
+        campaign = campaigns[-1]
+        campaign_id = int(campaign["id"])
+        channel = self.db.get_channel(chat_id)
+        if not channel:
+            return
+        if self.settings.distribute_mode == "category" and channel.get("category") != category:
+            return
 
         template = self.db.get_template(category)
         if not template or not template.get("photo_file_id"):
-            return
-
-        channel = self.db.get_channel(chat_id)
-        if not channel:
             return
         if self.permission_validator is not None:
             ok, _issues = await self.permission_validator(bot, channel)
@@ -619,35 +888,54 @@ class Publisher:
                 return
             channel = self.db.get_channel(chat_id) or channel
 
-        now = datetime.now(self.settings.timezone)
-        valid_expiries = [row.get("expires_at") for row in live_rows if row.get("expires_at")]
-        expires_at = min(valid_expiries) if valid_expiries else (
-            now + timedelta(hours=self.lifetime_hours(category))
-        ).isoformat(timespec="seconds")
+        try:
+            expires_dt = datetime.fromisoformat(campaign["expires_at"])
+            if expires_dt.tzinfo is None:
+                expires_dt = expires_dt.replace(tzinfo=self.settings.timezone)
+        except Exception:
+            expires_dt = datetime.now(self.settings.timezone) + timedelta(hours=self.lifetime_hours(category))
+
+        # Si el canal pertenece a la categoría promovida, crea su enlace exclusivo
+        # y refresca todos los posts antes de enviarle su propia copia.
+        cc = self.db.campaign_channel(campaign_id, chat_id)
+        desired_mode = "approval" if channel.get("invite_type") == "approval" else "direct"
+        needs_new_link = (
+            not cc or not cc.get("invite_link") or cc.get("entry_mode") != desired_mode
+        )
+        if channel.get("category") == category and needs_new_link:
+            if cc and cc.get("invite_link"):
+                try:
+                    await bot.revoke_chat_invite_link(chat_id=chat_id, invite_link=cc["invite_link"])
+                except TelegramError:
+                    pass
+            await self._create_campaign_link(bot, campaign_id, channel, expires_dt)
+            await self.refresh_category(bot, category)
+
         try:
             await self.delete_active_for_category_destination(bot, category, chat_id, "replaced")
-            start_count = await self._member_count(bot, chat_id, int(channel.get("member_count") or 0))
-            if start_count is not None:
-                self.db.set_channel_fields(chat_id, member_count=start_count)
             seed = self.new_shuffle_seed() if self.shuffle_enabled(category) else None
             msg = await bot.send_photo(
                 chat_id=chat_id,
                 photo=template["photo_file_id"],
                 caption=template.get("text") or None,
-                reply_markup=self.build_markup(category, shuffle_seed=seed),
+                reply_markup=self.build_markup(category, campaign_id=campaign_id, shuffle_seed=seed),
                 parse_mode="HTML",
             )
             self.db.add_board_message(
                 category,
                 chat_id,
                 msg.message_id,
-                now.date().isoformat(),
-                expires_at,
-                start_member_count=start_count,
+                datetime.now(self.settings.timezone).date().isoformat(),
+                campaign["expires_at"],
                 channel_category_start=channel.get("category"),
                 shuffle_seed=seed,
+                campaign_id=campaign_id,
             )
-            await self._send_started_notice(bot, channel, category, start_count, expires_at)
+            cc = self.db.campaign_channel(campaign_id, chat_id)
+            if cc and cc.get("invite_link"):
+                await self._send_started_notice(
+                    bot, channel, category, cc.get("start_member_count"), campaign["expires_at"],
+                )
         except TelegramError as exc:
             log.warning("No se pudo enviar la botonera vigente a %s: %s", chat_id, exc)
 
@@ -669,6 +957,16 @@ class Publisher:
                     deleted += 1
                 else:
                     failed += 1
+
+        for campaign in list(self.db.active_campaigns()):
+            try:
+                exp = datetime.fromisoformat(campaign["expires_at"])
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=self.settings.timezone)
+            except Exception:
+                continue
+            if exp <= now:
+                await self._close_campaign(bot, int(campaign["id"]), "expired")
 
         changes = self.apply_pending_categories_if_safe()
         await self._notify_category_changes(bot, changes)

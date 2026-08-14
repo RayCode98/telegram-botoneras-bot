@@ -349,3 +349,193 @@ También puede abrirse directamente con:
 ```
 
 Esta vía no depende de recibir de nuevo `my_chat_member`, por lo que sirve para canales que ya tenían al bot como administrador antes de que el sistema registrara correctamente el alta.
+
+---
+
+## v6.2 — Campañas con enlaces exclusivos y estadísticas atribuibles
+
+Desde v6.2 una botonera ya no usa el enlace permanente del canal para medir resultados. Cada ejecución crea una **campaña** y genera un enlace independiente para cada canal que aparece como botón.
+
+Ejemplo:
+
+```text
+Campaña #214 · 10K
+├─ Canal A → enlace exclusivo campaña #214
+├─ Canal B → enlace exclusivo campaña #214
+└─ Canal C → enlace exclusivo campaña #214
+```
+
+Los botones manuales agregados por un administrador no cambian y siguen fuera de la medición/mezcla de canales.
+
+### Solicitud de ingreso
+
+Si el canal tiene configurado:
+
+```text
+🛂 Solicitud de ingreso
+```
+
+el enlace de esa campaña se crea con:
+
+```python
+creates_join_request=True
+```
+
+y expira cuando termina la publicación.
+
+El bot recibe `chat_join_request`, reconoce el `invite_link` utilizado y registra la solicitud dentro de esa campaña. La clave lógica de una solicitud única es:
+
+```text
+campaign_id + channel_chat_id + telegram_user_id
+```
+
+Por eso si una persona manda dos veces la solicitud durante la misma campaña se obtiene, por ejemplo:
+
+```text
+Solicitudes únicas: 1
+Intentos de solicitud: 2
+```
+
+Cuando Telegram confirma que el usuario pasó a ser miembro mediante el enlace de campaña, se registra un ingreso confirmado.
+
+Reporte de ejemplo:
+
+```text
+📊 Resultados · Campaña #214
+
+Canal: Noticias México
+Categoría: 10K
+
+🛂 Solicitudes de ingreso
+Solicitudes únicas atribuidas: 326
+Ingresos confirmados: 241
+Sin ingreso confirmado: 85
+Conversión solicitud → ingreso: 73.9%
+
+👥 Crecimiento neto del canal
+Al iniciar: 12,450
+Al finalizar: 12,681
+Diferencia neta: +231
+```
+
+`Sin ingreso confirmado` **no significa necesariamente rechazado**. Puede incluir solicitudes pendientes, canceladas o no convertidas durante la ventana de la campaña. El bot no inventa un estado de rechazo si Telegram no se lo informó.
+
+### Ingreso directo
+
+Si el canal usa:
+
+```text
+🚪 Ingreso directo
+```
+
+el bot también crea un enlace exclusivo, pero con:
+
+```python
+creates_join_request=False
+```
+
+Los ingresos que Telegram atribuya a ese enlace se guardan como ingresos de la campaña.
+
+Ejemplo:
+
+```text
+🚪 Ingresos atribuidos al enlace: 187
+Miembros inicio: 8,532
+Miembros fin: 8,703
+Crecimiento neto: +171
+```
+
+Los valores no tienen por qué ser iguales. Durante la campaña pueden existir bajas y entradas por otras fuentes.
+
+### Por qué se mantienen dos métricas
+
+**Atribución de campaña**:
+
+- solicitudes generadas por el enlace exclusivo;
+- ingresos confirmados atribuibles al enlace.
+
+**Crecimiento neto**:
+
+- total de miembros al iniciar;
+- total de miembros al finalizar;
+- diferencia.
+
+Esto evita afirmar que todo el crecimiento neto fue generado por la botonera.
+
+### Ciclo de vida del enlace
+
+Al publicar:
+
+```text
+Crear campaña
+→ generar enlace exclusivo por canal
+→ publicar la botonera
+→ contar solicitudes/ingresos
+→ terminar duración
+→ eliminar publicaciones
+→ revocar enlaces
+→ cerrar campaña
+→ enviar estadísticas
+```
+
+Además de revocarlos al cierre, los enlaces se crean con fecha de expiración como segunda protección.
+
+### Cambios durante una campaña
+
+- El `shuffle` reconstruye el teclado usando los mismos enlaces exclusivos de la campaña.
+- Un refresco de botones no crea una campaña nueva.
+- Los botones manuales del administrador no reciben enlaces de atribución.
+- Si un canal aprobado entra mientras una campaña sigue activa, se genera su enlace exclusivo con la misma expiración de la campaña.
+- Si cambia de Ingreso directo a Solicitud de ingreso (o viceversa) y vuelve a aprobarse durante una campaña, se reemplaza el enlace de esa campaña por uno del modo correcto.
+
+### Historial del participante
+
+El apartado `📊 Estadísticas` muestra ahora también:
+
+```text
+🛂 Solicitudes atribuidas
+✅ Ingresos atribuidos
+📈 Crecimiento neto
+```
+
+Por canal, las campañas nuevas muestran:
+
+```text
+13/08/2026 · 9,850 → 10,021 · +171
+   🛂 248 solicitudes · ✅ 190 ingresos
+```
+
+El historial creado antes de v6.2 sigue apareciendo, simplemente sin las métricas de atribución que no existían en esas versiones.
+
+### Permisos necesarios
+
+Para que la medición funcione correctamente el bot debe continuar siendo administrador y conservar **Invitar usuarios**. Telegram exige ese permiso para recibir solicitudes de ingreso y para crear/revocar enlaces de invitación.
+
+La aplicación además solicita `chat_member` explícitamente mediante `Update.ALL_TYPES` para poder registrar cambios de membresía.
+
+### Actualización desde v6.1
+
+1. Haz respaldo de:
+
+```text
+.env
+botoneras.sqlite3
+```
+
+2. Reemplaza el código por v6.2.
+3. Conserva tu mismo `.env`.
+4. Instala/actualiza dependencias:
+
+```bash
+pip install -r requirements.txt
+```
+
+5. Arranca normalmente:
+
+```bash
+python main.py
+```
+
+No elimines `botoneras.sqlite3`. Al iniciar, el sistema crea automáticamente las tablas de campañas y agrega `campaign_id` a las publicaciones existentes.
+
+No se requieren variables nuevas de `.env` para esta versión.

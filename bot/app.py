@@ -15,6 +15,7 @@ from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatJoinRequestHandler,
     ChatMemberHandler,
     CommandHandler,
     ContextTypes,
@@ -862,14 +863,18 @@ async def participant_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         avg = float(summary.get("avg_delta") or 0)
         best = int(summary.get("best_delta") or 0)
         worst = int(summary.get("worst_delta") or 0)
+        total_requests = int(summary.get("total_requests") or 0)
+        total_joins = int(summary.get("total_attributed_joins") or 0)
         text = (
             "📊 <b>Mis estadísticas · últimos 30 días</b>\n\n"
             f"📣 Participaciones: <b>{int(summary.get('participations') or 0)}</b>\n"
+            f"🛂 Solicitudes atribuidas: <b>{total_requests:,}</b>\n"
+            f"✅ Ingresos atribuidos: <b>{total_joins:,}</b>\n"
             f"📈 Crecimiento neto registrado: <b>{total:+,}</b>\n"
-            f"Promedio por botonera: <b>{avg:+.1f}</b>\n"
-            f"🏆 Mejor resultado: <b>{best:+,}</b>\n"
-            f"📉 Peor resultado: <b>{worst:+,}</b>\n\n"
-            "Selecciona un canal para consultar el historial."
+            f"Promedio neto por botonera: <b>{avg:+.1f}</b>\n"
+            f"🏆 Mejor resultado neto: <b>{best:+,}</b>\n"
+            f"📉 Peor resultado neto: <b>{worst:+,}</b>\n\n"
+            "Selecciona un canal para consultar el historial detallado."
         )
         await q.edit_message_text(text, parse_mode="HTML", reply_markup=participant_stats_channels_keyboard(channels))
         return
@@ -888,9 +893,17 @@ async def participant_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         if not rows:
             lines.append("Todavía no hay participaciones finalizadas con estadísticas.")
         for row in rows:
-            date = (row.get("deleted_at") or row.get("published_date") or "")[:10]
+            date = (row.get("deleted_at") or row.get("created_at") or row.get("published_date") or "")[:10]
             start, end, delta = int(row.get("start_member_count") or 0), int(row.get("end_member_count") or 0), int(row.get("member_delta") or 0)
-            lines.append(f"📅 {html.escape(date)} · {start:,} → {end:,} · <b>{delta:+,}</b>")
+            base = f"📅 {html.escape(date)} · {start:,} → {end:,} · <b>{delta:+,}</b>"
+            if row.get("stats_source") == "campaign":
+                joined = int(row.get("joined_count") or 0)
+                if row.get("entry_mode") == "approval":
+                    requests = int(row.get("requests_count") or 0)
+                    base += f"\n   🛂 {requests:,} solicitudes · ✅ {joined:,} ingresos"
+                else:
+                    base += f"\n   🚪 ✅ {joined:,} ingresos atribuidos"
+            lines.append(base)
         await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=participant_stats_history_keyboard(chat_id, page, pages))
         return
     if data.startswith("user:progress:"):
@@ -1308,11 +1321,22 @@ async def admin_category_callback(update: Update, context: ContextTypes.DEFAULT_
         s = db.get_schedule(category) or {}
         lifetime = float(s.get("lifetime_hours") or settings.default_lifetime_hours)
         active_count = len(db.live_board_messages(category))
+        active_campaigns = db.active_campaigns(category)
+        campaign_line = ""
+        if active_campaigns:
+            cp = active_campaigns[-1]
+            tracked = db.campaign_channels(int(cp["id"]))
+            reqs = sum(int(r.get("requests_count") or 0) for r in tracked)
+            joins = sum(int(r.get("joined_count") or 0) for r in tracked)
+            campaign_line = (
+                f"Campaña activa: <b>#{cp['id']}</b> · 🛂 {reqs:,} solicitudes · ✅ {joins:,} ingresos\n"
+            )
         await q.edit_message_text(
             f"📣 <b>{category}</b>\n\n"
             f"Destinos actuales: <b>{len(publisher.destinations(category))}</b>\n"
             f"Botones: <b>{len(db.approved_channels(category)) + len(db.manual_buttons(category))}</b>\n"
             f"Publicaciones activas: <b>{active_count}</b>\n"
+            f"{campaign_line}"
             f"Duración: <b>{lifetime:g} horas</b>\n\n"
             "Puedes publicar ahora o eliminar manualmente todas las copias activas.",
             parse_mode="HTML",
@@ -1391,6 +1415,8 @@ async def publish_panel_callback(update: Update, context: ContextTypes.DEFAULT_T
             return
         await q.edit_message_text(
             f"✅ <b>Botonera {category} publicada.</b>\n\n"
+            f"Campaña: <b>#{result.get('campaign_id','—')}</b>\n"
+            f"Canales con enlace atribuible: <b>{result.get('tracked_channels',0)}</b>\n"
             f"Enviadas: <b>{result['sent']}</b>\n"
             f"Fallidas: <b>{result['failed']}</b>\n"
             f"Expira: <code>{html.escape(result['expires_at'])}</code>",
@@ -2021,7 +2047,11 @@ async def publish_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("Uso: /publicar 5K")
         return
     result = await publisher.publish_category(context.bot, cat)
-    await update.effective_message.reply_text(result.get("reason") or f"{cat}: {result['sent']} enviadas, {result['failed']} fallidas. Expira {result['expires_at']}")
+    await update.effective_message.reply_text(
+        result.get("reason") or
+        f"{cat}: campaña #{result.get('campaign_id','—')} · {result['sent']} enviadas, "
+        f"{result['failed']} fallidas · {result.get('tracked_channels',0)} canales medibles · expira {result['expires_at']}"
+    )
 
 
 async def delete_publication_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2240,6 +2270,75 @@ async def transfer_channel_command(update: Update, context: ContextTypes.DEFAULT
 
 
 # ---------------------------------------------------------------------
+# Campaign attribution updates (v6.2)
+# ---------------------------------------------------------------------
+def _chat_member_is_inside(member) -> bool:
+    status = getattr(member, "status", None)
+    if status in {ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER}:
+        return True
+    if status == ChatMemberStatus.RESTRICTED:
+        return bool(getattr(member, "is_member", False))
+    return False
+
+
+async def on_chat_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cuenta solicitudes únicas usando el enlace exclusivo de la campaña."""
+    request = update.chat_join_request
+    if not request or not request.from_user or request.from_user.is_bot:
+        return
+    link_obj = request.invite_link
+    if not link_obj or not getattr(link_obj, "invite_link", None):
+        # Telegram también puede generar solicitudes sin invite link; no las
+        # atribuimos a una botonera para evitar inflar las estadísticas.
+        return
+    when = request.date.isoformat(timespec="seconds") if request.date else datetime.now(settings.timezone).isoformat(timespec="seconds")
+    target = db.record_campaign_request(link_obj.invite_link, request.from_user.id, when)
+    if target:
+        log.info(
+            "Solicitud atribuida campaña #%s canal %s usuario %s",
+            target.get("campaign_id"), target.get("chat_id"), request.from_user.id,
+        )
+
+
+async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Atribuye ingresos confirmados y salidas a campañas activas."""
+    event = update.chat_member
+    if not event:
+        return
+    user = getattr(event.new_chat_member, "user", None)
+    if not user or user.is_bot:
+        return
+
+    was_inside = _chat_member_is_inside(event.old_chat_member)
+    is_inside = _chat_member_is_inside(event.new_chat_member)
+    when = event.date.isoformat(timespec="seconds") if event.date else datetime.now(settings.timezone).isoformat(timespec="seconds")
+
+    if not was_inside and is_inside:
+        link_obj = event.invite_link
+        if link_obj and getattr(link_obj, "invite_link", None):
+            target = db.record_campaign_join(
+                link_obj.invite_link,
+                user.id,
+                when,
+                bool(getattr(event, "via_join_request", False)),
+            )
+            if target:
+                log.info(
+                    "Ingreso atribuido campaña #%s canal %s usuario %s",
+                    target.get("campaign_id"), target.get("chat_id"), user.id,
+                )
+        elif bool(getattr(event, "via_join_request", False)):
+            # Fallback robusto: si Telegram confirma que entró tras una solicitud
+            # pero omite invite_link en esta transición, correlacionamos con su
+            # solicitud pendiente activa del mismo canal.
+            db.record_campaign_join_from_pending(event.chat.id, user.id, when)
+        return
+
+    if was_inside and not is_inside:
+        db.record_campaign_leave(event.chat.id, user.id, when)
+
+
+# ---------------------------------------------------------------------
 # Maintenance jobs
 # ---------------------------------------------------------------------
 async def daily_job(context: ContextTypes.DEFAULT_TYPE):
@@ -2455,6 +2554,10 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("transferircanal", transfer_channel_command))
 
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    # CHAT_MEMBER no se recibe por defecto en la Bot API; run_polling usa
+    # Update.ALL_TYPES abajo, así que PTB lo solicita explícitamente.
+    app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(ChatJoinRequestHandler(on_chat_join_request))
 
     app.add_handler(CallbackQueryHandler(config_link_callback, pattern=r"^cfg_link:"))
     app.add_handler(CallbackQueryHandler(config_color_callback, pattern=r"^cfg_color:"))

@@ -178,6 +178,65 @@ CREATE TABLE IF NOT EXISTS ownership_conflicts (
 );
 CREATE INDEX IF NOT EXISTS idx_ownership_conflicts_chat ON ownership_conflicts(chat_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS campaigns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    started_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    closed_at TEXT,
+    closure_reason TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_campaigns_active ON campaigns(category, status, expires_at);
+
+CREATE TABLE IF NOT EXISTS campaign_channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    entry_mode TEXT NOT NULL DEFAULT 'direct',
+    invite_link TEXT,
+    invite_link_name TEXT,
+    start_member_count INTEGER,
+    end_member_count INTEGER,
+    member_delta INTEGER,
+    requests_count INTEGER NOT NULL DEFAULT 0,
+    request_events INTEGER NOT NULL DEFAULT 0,
+    joined_count INTEGER NOT NULL DEFAULT 0,
+    left_count INTEGER NOT NULL DEFAULT 0,
+    stats_sent_at TEXT,
+    stats_error TEXT,
+    stats_attempts INTEGER NOT NULL DEFAULT 0,
+    stats_last_attempt_at TEXT,
+    link_revoked_at TEXT,
+    link_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(campaign_id, chat_id),
+    FOREIGN KEY(campaign_id) REFERENCES campaigns(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_campaign_channels_link ON campaign_channels(invite_link) WHERE invite_link IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_campaign_channels_campaign ON campaign_channels(campaign_id, chat_id);
+
+CREATE TABLE IF NOT EXISTS campaign_users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    invite_link TEXT,
+    requested_at TEXT,
+    request_count INTEGER NOT NULL DEFAULT 0,
+    joined_at TEXT,
+    left_at TEXT,
+    via_join_request INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(campaign_id, chat_id, user_id),
+    FOREIGN KEY(campaign_id) REFERENCES campaigns(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_campaign_users_link ON campaign_users(invite_link);
+CREATE INDEX IF NOT EXISTS idx_campaign_users_lookup ON campaign_users(chat_id, user_id, campaign_id);
+
 CREATE TABLE IF NOT EXISTS system_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_type TEXT NOT NULL,
@@ -244,6 +303,7 @@ class Database:
         self._ensure_column("channels", "permission_issues", "TEXT")
         self._ensure_column("channels", "permission_checked_at", "TEXT")
         self._ensure_column("channels", "owner_bound_at", "TEXT")
+        self._ensure_column("board_messages", "campaign_id", "INTEGER")
         with self.connection() as conn:
             # v6.1: antes la interfaz llamaba "público/privado" al tipo de enlace.
             # Ambos modos antiguos permitían ingreso directo, por lo que se migran
@@ -255,6 +315,7 @@ class Database:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_board_messages_live ON board_messages(category, active, expires_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_board_messages_chat ON board_messages(destination_chat_id, active)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_board_stats_pending ON board_messages(stats_sent_at, end_member_count)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_board_messages_campaign ON board_messages(campaign_id, active)")
 
     def execute(self, sql: str, params: Iterable[Any] = ()) -> int:
         with self.connection() as conn:
@@ -611,28 +672,53 @@ class Database:
         )
 
     def channel_stats_history(self, user_id: int, chat_id: int, limit: int = 5, offset: int = 0) -> list[dict]:
+        # v6.2: las campañas nuevas se miden por el enlace exclusivo del canal.
+        # Se conservan también los históricos v6.1 (board_messages sin campaign_id).
         return self.all(
             """
-            SELECT bm.* FROM board_messages bm
-            JOIN channels c ON c.chat_id=bm.destination_chat_id
-            WHERE c.owner_user_id=? AND c.chat_id=?
-              AND bm.end_member_count IS NOT NULL AND bm.member_delta IS NOT NULL
-              AND bm.removal_reason IN ('expired','manual_admin_delete')
-            ORDER BY bm.id DESC LIMIT ? OFFSET ?
+            SELECT * FROM (
+                SELECT cc.id AS id, cp.category AS category, cp.started_at AS created_at,
+                       cp.closed_at AS deleted_at, cc.start_member_count, cc.end_member_count,
+                       cc.member_delta, cc.requests_count, cc.request_events, cc.joined_count,
+                       cc.left_count, cc.entry_mode, cc.campaign_id, 'campaign' AS stats_source
+                FROM campaign_channels cc
+                JOIN campaigns cp ON cp.id=cc.campaign_id
+                JOIN channels c ON c.chat_id=cc.chat_id
+                WHERE c.owner_user_id=? AND c.chat_id=? AND cc.invite_link IS NOT NULL AND cc.end_member_count IS NOT NULL
+                UNION ALL
+                SELECT bm.id AS id, bm.category, bm.created_at, bm.deleted_at,
+                       bm.start_member_count, bm.end_member_count, bm.member_delta,
+                       0 AS requests_count, 0 AS request_events, 0 AS joined_count, 0 AS left_count,
+                       NULL AS entry_mode, NULL AS campaign_id, 'legacy' AS stats_source
+                FROM board_messages bm
+                JOIN channels c ON c.chat_id=bm.destination_chat_id
+                WHERE c.owner_user_id=? AND c.chat_id=?
+                  AND bm.campaign_id IS NULL
+                  AND bm.end_member_count IS NOT NULL AND bm.member_delta IS NOT NULL
+                  AND bm.removal_reason IN ('expired','manual_admin_delete')
+            ) h
+            ORDER BY COALESCE(h.deleted_at, h.created_at) DESC
+            LIMIT ? OFFSET ?
             """,
-            (user_id, chat_id, limit, offset),
+            (user_id, chat_id, user_id, chat_id, limit, offset),
         )
 
     def channel_stats_count(self, user_id: int, chat_id: int) -> int:
         row = self.one(
             """
-            SELECT COUNT(*) AS n FROM board_messages bm
-            JOIN channels c ON c.chat_id=bm.destination_chat_id
-            WHERE c.owner_user_id=? AND c.chat_id=?
-              AND bm.end_member_count IS NOT NULL AND bm.member_delta IS NOT NULL
-              AND bm.removal_reason IN ('expired','manual_admin_delete')
+            SELECT (
+                SELECT COUNT(*) FROM campaign_channels cc
+                JOIN channels c ON c.chat_id=cc.chat_id
+                WHERE c.owner_user_id=? AND c.chat_id=? AND cc.invite_link IS NOT NULL AND cc.end_member_count IS NOT NULL
+            ) + (
+                SELECT COUNT(*) FROM board_messages bm
+                JOIN channels c ON c.chat_id=bm.destination_chat_id
+                WHERE c.owner_user_id=? AND c.chat_id=? AND bm.campaign_id IS NULL
+                  AND bm.end_member_count IS NOT NULL AND bm.member_delta IS NOT NULL
+                  AND bm.removal_reason IN ('expired','manual_admin_delete')
+            ) AS n
             """,
-            (user_id, chat_id),
+            (user_id, chat_id, user_id, chat_id),
         )
         return int((row or {}).get("n") or 0)
 
@@ -640,19 +726,34 @@ class Database:
         row = self.one(
             """
             SELECT COUNT(*) AS participations,
-                   COALESCE(SUM(bm.member_delta), 0) AS total_delta,
-                   COALESCE(AVG(bm.member_delta), 0) AS avg_delta,
-                   COALESCE(MAX(bm.member_delta), 0) AS best_delta,
-                   COALESCE(MIN(bm.member_delta), 0) AS worst_delta
-            FROM board_messages bm
-            JOIN channels c ON c.chat_id=bm.destination_chat_id
-            WHERE c.owner_user_id=?
-              AND bm.end_member_count IS NOT NULL AND bm.member_delta IS NOT NULL
-              AND datetime(bm.deleted_at) >= datetime('now', ?)
+                   COALESCE(SUM(x.member_delta), 0) AS total_delta,
+                   COALESCE(AVG(x.member_delta), 0) AS avg_delta,
+                   COALESCE(MAX(x.member_delta), 0) AS best_delta,
+                   COALESCE(MIN(x.member_delta), 0) AS worst_delta,
+                   COALESCE(SUM(x.requests_count), 0) AS total_requests,
+                   COALESCE(SUM(x.joined_count), 0) AS total_attributed_joins
+            FROM (
+                SELECT cc.member_delta, cc.requests_count, cc.joined_count, cp.closed_at AS finished_at
+                FROM campaign_channels cc
+                JOIN campaigns cp ON cp.id=cc.campaign_id
+                JOIN channels c ON c.chat_id=cc.chat_id
+                WHERE c.owner_user_id=? AND cc.invite_link IS NOT NULL AND cc.end_member_count IS NOT NULL
+                UNION ALL
+                SELECT bm.member_delta, 0, 0, bm.deleted_at
+                FROM board_messages bm
+                JOIN channels c ON c.chat_id=bm.destination_chat_id
+                WHERE c.owner_user_id=? AND bm.campaign_id IS NULL
+                  AND bm.end_member_count IS NOT NULL AND bm.member_delta IS NOT NULL
+            ) x
+            WHERE datetime(x.finished_at) >= datetime('now', ?)
             """,
-            (user_id, f'-{int(days)} days'),
+            (user_id, user_id, f'-{int(days)} days'),
         )
-        return row or {"participations": 0, "total_delta": 0, "avg_delta": 0, "best_delta": 0, "worst_delta": 0}
+        return row or {
+            "participations": 0, "total_delta": 0, "avg_delta": 0,
+            "best_delta": 0, "worst_delta": 0, "total_requests": 0,
+            "total_attributed_joins": 0,
+        }
 
     # Categories, templates, schedules ---------------------------------
     def ensure_categories(self, categories: tuple[str, ...], default_lifetime_hours: float):
@@ -777,17 +878,18 @@ class Database:
         start_member_count: int | None = None,
         channel_category_start: str | None = None,
         shuffle_seed: int | None = None,
+        campaign_id: int | None = None,
     ) -> int:
         return self.execute(
             """
             INSERT INTO board_messages(
                 category, destination_chat_id, message_id, published_date,
-                active, created_at, expires_at, start_member_count, channel_category_start, shuffle_seed
-            ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+                active, created_at, expires_at, start_member_count, channel_category_start, shuffle_seed, campaign_id
+            ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
             """,
             (
                 category, destination_chat_id, message_id, published_date, now_iso(),
-                expires_at, start_member_count, channel_category_start, shuffle_seed,
+                expires_at, start_member_count, channel_category_start, shuffle_seed, campaign_id,
             ),
         )
 
@@ -868,6 +970,269 @@ class Database:
         new = channel.get("pending_category")
         self.set_channel_fields(chat_id, category=new, pending_category=None)
         return old, new
+
+    # Campaign attribution (v6.2) ---------------------------------------
+    def create_campaign(self, category: str, started_at: str, expires_at: str) -> int:
+        return self.execute(
+            """INSERT INTO campaigns(category, status, started_at, expires_at, created_at)
+               VALUES (?, 'active', ?, ?, ?)""",
+            (category, started_at, expires_at, now_iso()),
+        )
+
+    def get_campaign(self, campaign_id: int) -> dict | None:
+        return self.one("SELECT * FROM campaigns WHERE id=?", (campaign_id,))
+
+    def active_campaigns(self, category: str | None = None) -> list[dict]:
+        if category:
+            return self.all(
+                "SELECT * FROM campaigns WHERE status='active' AND category=? ORDER BY id",
+                (category,),
+            )
+        return self.all("SELECT * FROM campaigns WHERE status='active' ORDER BY id")
+
+    def close_campaign(self, campaign_id: int, reason: str):
+        self.execute(
+            "UPDATE campaigns SET status='closed', closed_at=?, closure_reason=? WHERE id=? AND status='active'",
+            (now_iso(), reason, campaign_id),
+        )
+
+    def add_campaign_channel(
+        self, campaign_id: int, chat_id: int, entry_mode: str, invite_link: str | None,
+        invite_link_name: str | None, start_member_count: int | None, link_error: str | None = None,
+    ) -> int:
+        now = now_iso()
+        return self.execute(
+            """
+            INSERT INTO campaign_channels(
+                campaign_id, chat_id, entry_mode, invite_link, invite_link_name,
+                start_member_count, link_error, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(campaign_id, chat_id) DO UPDATE SET
+                entry_mode=excluded.entry_mode,
+                invite_link=COALESCE(excluded.invite_link, campaign_channels.invite_link),
+                invite_link_name=COALESCE(excluded.invite_link_name, campaign_channels.invite_link_name),
+                start_member_count=COALESCE(campaign_channels.start_member_count, excluded.start_member_count),
+                link_revoked_at=NULL,
+                link_error=excluded.link_error,
+                updated_at=excluded.updated_at
+            """,
+            (campaign_id, chat_id, entry_mode, invite_link, invite_link_name,
+             start_member_count, link_error, now, now),
+        )
+
+    def campaign_channels(self, campaign_id: int) -> list[dict]:
+        return self.all(
+            """
+            SELECT cc.*, c.telegram_title, c.button_title, c.button_style, c.owner_user_id,
+                   c.category AS channel_category, c.pending_category, c.status AS channel_status
+            FROM campaign_channels cc
+            LEFT JOIN channels c ON c.chat_id=cc.chat_id
+            WHERE cc.campaign_id=? ORDER BY cc.id
+            """,
+            (campaign_id,),
+        )
+
+    def campaign_button_channels(self, campaign_id: int) -> list[dict]:
+        return self.all(
+            """
+            SELECT cc.*, c.telegram_title, c.button_title, c.button_style, c.owner_user_id,
+                   c.category AS channel_category, c.status AS channel_status
+            FROM campaign_channels cc
+            JOIN channels c ON c.chat_id=cc.chat_id
+            WHERE cc.campaign_id=? AND c.status='approved'
+              AND cc.invite_link IS NOT NULL AND cc.link_revoked_at IS NULL
+              AND cc.link_error IS NULL
+            ORDER BY COALESCE(c.button_title, c.telegram_title) COLLATE NOCASE
+            """,
+            (campaign_id,),
+        )
+
+    def campaign_channel(self, campaign_id: int, chat_id: int) -> dict | None:
+        return self.one(
+            "SELECT * FROM campaign_channels WHERE campaign_id=? AND chat_id=?",
+            (campaign_id, chat_id),
+        )
+
+    def campaign_channel_by_link(self, invite_link: str) -> dict | None:
+        return self.one(
+            """
+            SELECT cc.*, cp.status AS campaign_status, cp.category, cp.expires_at
+            FROM campaign_channels cc JOIN campaigns cp ON cp.id=cc.campaign_id
+            WHERE cc.invite_link=? ORDER BY cc.id DESC LIMIT 1
+            """,
+            (invite_link,),
+        )
+
+    def record_campaign_request(self, invite_link: str, user_id: int, requested_at: str) -> dict | None:
+        target = self.campaign_channel_by_link(invite_link)
+        if not target or target.get("campaign_status") != "active":
+            return None
+        now = now_iso()
+        existing = self.one(
+            "SELECT * FROM campaign_users WHERE campaign_id=? AND chat_id=? AND user_id=?",
+            (target["campaign_id"], target["chat_id"], user_id),
+        )
+        if existing:
+            first = existing.get("requested_at") or requested_at
+            self.execute(
+                """UPDATE campaign_users SET invite_link=?, requested_at=?, request_count=COALESCE(request_count,0)+1,
+                   updated_at=? WHERE id=?""",
+                (invite_link, first, now, existing["id"]),
+            )
+        else:
+            self.execute(
+                """INSERT INTO campaign_users(
+                    campaign_id, chat_id, user_id, invite_link, requested_at, request_count, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)""",
+                (target["campaign_id"], target["chat_id"], user_id, invite_link, requested_at, now, now),
+            )
+        self.refresh_campaign_counters(target["campaign_id"], target["chat_id"])
+        return target
+
+    def record_campaign_join(
+        self, invite_link: str, user_id: int, joined_at: str, via_join_request: bool = False,
+    ) -> dict | None:
+        target = self.campaign_channel_by_link(invite_link)
+        if not target or target.get("campaign_status") != "active":
+            return None
+        now = now_iso()
+        existing = self.one(
+            "SELECT * FROM campaign_users WHERE campaign_id=? AND chat_id=? AND user_id=?",
+            (target["campaign_id"], target["chat_id"], user_id),
+        )
+        if existing:
+            first_join = existing.get("joined_at") or joined_at
+            self.execute(
+                """UPDATE campaign_users SET invite_link=?, joined_at=?, left_at=NULL,
+                   via_join_request=MAX(via_join_request, ?), updated_at=? WHERE id=?""",
+                (invite_link, first_join, int(via_join_request), now, existing["id"]),
+            )
+        else:
+            self.execute(
+                """INSERT INTO campaign_users(
+                    campaign_id, chat_id, user_id, invite_link, joined_at, via_join_request, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (target["campaign_id"], target["chat_id"], user_id, invite_link,
+                 joined_at, int(via_join_request), now, now),
+            )
+        self.refresh_campaign_counters(target["campaign_id"], target["chat_id"])
+        return target
+
+    def record_campaign_join_from_pending(self, chat_id: int, user_id: int, joined_at: str) -> dict | None:
+        row = self.one(
+            """
+            SELECT cu.invite_link FROM campaign_users cu
+            JOIN campaigns cp ON cp.id=cu.campaign_id
+            WHERE cu.chat_id=? AND cu.user_id=? AND cu.requested_at IS NOT NULL
+              AND cu.joined_at IS NULL AND cp.status='active'
+            ORDER BY cu.id DESC LIMIT 1
+            """,
+            (chat_id, user_id),
+        )
+        if not row or not row.get("invite_link"):
+            return None
+        return self.record_campaign_join(row["invite_link"], user_id, joined_at, True)
+
+    def record_campaign_leave(self, chat_id: int, user_id: int, left_at: str):
+        rows = self.all(
+            """
+            SELECT cu.id, cu.campaign_id, cu.chat_id FROM campaign_users cu
+            JOIN campaigns cp ON cp.id=cu.campaign_id
+            WHERE cu.chat_id=? AND cu.user_id=? AND cu.joined_at IS NOT NULL
+              AND cu.left_at IS NULL AND cp.status='active'
+            """,
+            (chat_id, user_id),
+        )
+        for row in rows:
+            self.execute("UPDATE campaign_users SET left_at=?, updated_at=? WHERE id=?", (left_at, now_iso(), row["id"]))
+            self.refresh_campaign_counters(row["campaign_id"], row["chat_id"])
+
+    def refresh_campaign_counters(self, campaign_id: int, chat_id: int):
+        counts = self.one(
+            """
+            SELECT COUNT(CASE WHEN requested_at IS NOT NULL THEN 1 END) AS requests_count,
+                   COALESCE(SUM(request_count),0) AS request_events,
+                   COUNT(CASE WHEN joined_at IS NOT NULL THEN 1 END) AS joined_count,
+                   COUNT(CASE WHEN joined_at IS NOT NULL AND left_at IS NOT NULL THEN 1 END) AS left_count
+            FROM campaign_users WHERE campaign_id=? AND chat_id=?
+            """,
+            (campaign_id, chat_id),
+        ) or {}
+        self.execute(
+            """UPDATE campaign_channels SET requests_count=?, request_events=?, joined_count=?, left_count=?, updated_at=?
+               WHERE campaign_id=? AND chat_id=?""",
+            (int(counts.get("requests_count") or 0), int(counts.get("request_events") or 0),
+             int(counts.get("joined_count") or 0), int(counts.get("left_count") or 0),
+             now_iso(), campaign_id, chat_id),
+        )
+
+    def finalize_campaign_channel(self, campaign_id: int, chat_id: int, end_count: int | None, delta: int | None):
+        self.refresh_campaign_counters(campaign_id, chat_id)
+        self.execute(
+            """UPDATE campaign_channels SET end_member_count=?, member_delta=?, updated_at=?
+               WHERE campaign_id=? AND chat_id=?""",
+            (end_count, delta, now_iso(), campaign_id, chat_id),
+        )
+
+    def mark_campaign_link_revoked(self, campaign_id: int, chat_id: int, error: str | None = None):
+        if error:
+            self.execute(
+                "UPDATE campaign_channels SET link_error=?, updated_at=? WHERE campaign_id=? AND chat_id=?",
+                (error, now_iso(), campaign_id, chat_id),
+            )
+        else:
+            self.execute(
+                "UPDATE campaign_channels SET link_revoked_at=?, link_error=NULL, updated_at=? WHERE campaign_id=? AND chat_id=?",
+                (now_iso(), now_iso(), campaign_id, chat_id),
+            )
+
+    def campaign_stats_row(self, campaign_channel_id: int) -> dict | None:
+        return self.one(
+            """
+            SELECT cc.*, cp.category, cp.started_at, cp.expires_at, cp.closed_at, cp.closure_reason,
+                   c.telegram_title, c.owner_user_id, c.category AS channel_category_current, c.pending_category
+            FROM campaign_channels cc
+            JOIN campaigns cp ON cp.id=cc.campaign_id
+            LEFT JOIN channels c ON c.chat_id=cc.chat_id
+            WHERE cc.id=?
+            """,
+            (campaign_channel_id,),
+        )
+
+    def mark_campaign_stats_sent(self, campaign_channel_id: int):
+        self.execute(
+            """UPDATE campaign_channels SET stats_sent_at=?, stats_error=NULL, stats_last_attempt_at=?, updated_at=?
+               WHERE id=?""",
+            (now_iso(), now_iso(), now_iso(), campaign_channel_id),
+        )
+
+    def note_campaign_stats_attempt(self, campaign_channel_id: int, error: str | None = None):
+        self.execute(
+            """UPDATE campaign_channels SET stats_attempts=COALESCE(stats_attempts,0)+1,
+               stats_last_attempt_at=?, stats_error=?, updated_at=? WHERE id=?""",
+            (now_iso(), error, now_iso(), campaign_channel_id),
+        )
+
+    def pending_campaign_stats(self, limit: int = 100) -> list[dict]:
+        return self.all(
+            """
+            SELECT cc.*, cp.category, cp.started_at, cp.closed_at, cp.closure_reason,
+                   c.telegram_title, c.owner_user_id, c.category AS channel_category_current, c.pending_category
+            FROM campaign_channels cc
+            JOIN campaigns cp ON cp.id=cc.campaign_id
+            LEFT JOIN channels c ON c.chat_id=cc.chat_id
+            WHERE cp.status='closed' AND cc.invite_link IS NOT NULL AND cc.end_member_count IS NOT NULL
+              AND cc.stats_sent_at IS NULL AND COALESCE(cc.stats_attempts,0) < 5
+            ORDER BY cc.id LIMIT ?
+            """,
+            (limit,),
+        )
+
+    def active_board_messages_for_campaign(self, campaign_id: int) -> list[dict]:
+        return self.all(
+            "SELECT * FROM board_messages WHERE campaign_id=? AND active=1 ORDER BY id",
+            (campaign_id,),
+        )
 
     # Sessions ----------------------------------------------------------
     def set_session(
