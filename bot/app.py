@@ -20,6 +20,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    PreCheckoutQueryHandler,
     filters,
 )
 
@@ -57,6 +58,7 @@ from .keyboards import (
 from .moderation import ModerationService
 from .maintenance import MaintenanceService
 from .publisher import Publisher
+from .monetization import MonetizationService
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -187,6 +189,7 @@ def _category_progress(member_count: int, category: str) -> tuple[int | None, st
 maintenance = MaintenanceService(db, settings, safe_dm)
 publisher.permission_validator = maintenance.validate_publish_destination
 moderation = ModerationService(db, settings, publisher, is_admin, safe_dm)
+monetization = MonetizationService(db, settings, publisher, safe_dm, is_admin)
 
 
 async def admin_only(update: Update) -> bool:
@@ -280,7 +283,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_html(
         "<b>Propietarios</b>\n"
         "/start — registrar chat privado\n"
-        "/miscanales — ver/editar canales\n/verificarcanal — recuperar manualmente un canal ya agregado\n\n"
+        "/miscanales — ver/editar canales\n/verificarcanal — recuperar manualmente un canal ya agregado\n"
+        "/monetizacion — ganancias y campañas pagadas disponibles\n"
+        "/publicidad — crear/consultar campañas patrocinadas\n"
+        "/paysupport — soporte relacionado con pagos en Telegram Stars\n\n"
         "<b>Administradores</b>\n"
         "/panel — panel visual completo\n"
         "/publicar 5K — publicar ahora\n/eliminarpublicacion 5K — borrar la botonera activa de todos los canales\n"
@@ -536,6 +542,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.set_channel_permission_state(chat.id, not missing, "; ".join(missing) if missing else None)
             if missing and existing.get("status") == "approved":
                 db.set_channel_fields(chat.id, status="permission_suspended")
+                await monetization.disable_source_channel(context.bot, chat.id, "permissions_lost")
                 if existing.get("category") in CATEGORIES:
                     await publisher.refresh_category(context.bot, existing["category"])
                 await safe_dm(
@@ -570,6 +577,8 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if actor and actor.id == bot_id:
             return
         if existing and old_was_admin:
+            # Si era fuente de una campaña pagada, corta atribución nueva de inmediato.
+            await monetization.disable_source_channel(context.bot, chat.id, "bot_removed")
             responsible = actor.id if actor and not actor.is_bot else existing.get("owner_user_id")
             state = await moderation.handle_bot_removed(context.bot, existing, responsible)
             if state:
@@ -1036,6 +1045,7 @@ async def participant_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         old_cat = ch.get("category")
         db.set_channel_fields(chat_id, status="withdrawn")
+        await monetization.disable_source_channel(context.bot, chat_id, "voluntary_withdrawal")
         await publisher.delete_active_posts_for_chat(context.bot, chat_id, "voluntary_withdrawal")
         if old_cat in CATEGORIES:
             await publisher.refresh_category(context.bot, old_cat)
@@ -1069,6 +1079,44 @@ async def participant_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Inicio", callback_data="user:home")]]),
         )
         return
+
+
+# ---------------------------------------------------------------------
+# Monetization commands
+# ---------------------------------------------------------------------
+async def monetization_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.effective_message:
+        return
+    # Reutilizamos la UI de callbacks enviando un mensaje inicial.
+    uid = update.effective_user.id
+    profile = db.get_monetization_profile(uid)
+    wallet = db.wallet_summary(uid)
+    from .monetization import milli_xtr_text
+    await update.effective_message.reply_html(
+        "💰 <b>Monetización</b>\n\n"
+        f"Estado: <b>{'🟢 activa' if profile.get('enabled') else '⚪️ desactivada'}</b>\n"
+        f"Disponible: <b>{milli_xtr_text(wallet['available_milli'])}</b>\n"
+        f"Pendiente: <b>{milli_xtr_text(wallet['pending_milli'])}</b>",
+        reply_markup=monetization.money_home_keyboard(uid),
+    )
+
+
+async def advertising_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.effective_message:
+        return
+    uid = update.effective_user.id
+    await update.effective_message.reply_html(
+        "📢 <b>Publicidad con Telegram Stars</b>\n\nCrea campañas para promocionar uno de tus canales y adquirir miembros reales de forma voluntaria.",
+        reply_markup=monetization.ads_home_keyboard(uid),
+    )
+
+
+async def paysupport_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_html(
+        "🧾 <b>Soporte de pagos</b>\n\n"
+        "Si tuviste un problema con una campaña pagada en Telegram Stars, responde en este chat describiendo el número de campaña y el inconveniente. "
+        "Un administrador puede revisar el pago y, cuando corresponda, usar el reembolso de Telegram Stars."
+    )
 
 
 # ---------------------------------------------------------------------
@@ -2291,6 +2339,10 @@ async def on_chat_join_request(update: Update, context: ContextTypes.DEFAULT_TYP
         # Telegram también puede generar solicitudes sin invite link; no las
         # atribuimos a una botonera para evitar inflar las estadísticas.
         return
+    # Primero intentamos atribución monetizada. Los enlaces patrocinados son
+    # exclusivos por fuente y no deben mezclarse con estadísticas de botoneras gratis.
+    if await monetization.on_join_request(context.bot, request):
+        return
     when = request.date.isoformat(timespec="seconds") if request.date else datetime.now(settings.timezone).isoformat(timespec="seconds")
     target = db.record_campaign_request(link_obj.invite_link, request.from_user.id, when)
     if target:
@@ -2312,6 +2364,11 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     was_inside = _chat_member_is_inside(event.old_chat_member)
     is_inside = _chat_member_is_inside(event.new_chat_member)
     when = event.date.isoformat(timespec="seconds") if event.date else datetime.now(settings.timezone).isoformat(timespec="seconds")
+
+    # La monetización lleva un segundo sistema de atribución por enlace fuente.
+    # No hacemos return: una salida puede ser relevante también para estadísticas
+    # de una botonera normal del mismo canal.
+    await monetization.on_chat_member(context.bot, event)
 
     if not was_inside and is_inside:
         link_obj = event.invite_link
@@ -2336,6 +2393,17 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if was_inside and not is_inside:
         db.record_campaign_leave(event.chat.id, user.id, when)
+
+
+# ---------------------------------------------------------------------
+# Monetization job
+# ---------------------------------------------------------------------
+async def monetization_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await monetization.job(context)
+    except Exception as exc:
+        db.log_system_event("monetization_job_error", str(exc), "error")
+        log.exception("Error en motor de monetización")
 
 
 # ---------------------------------------------------------------------
@@ -2503,6 +2571,13 @@ async def post_init(application: Application):
         first=15,
         name="maintenance:upcoming",
     )
+    if settings.monetization_enabled:
+        application.job_queue.run_repeating(
+            monetization_job,
+            interval=60,
+            first=20,
+            name="monetization:engine",
+        )
     application.job_queue.run_repeating(
         permission_audit_job,
         interval=settings.permission_check_seconds,
@@ -2552,12 +2627,22 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("backup", backup_command))
     app.add_handler(CommandHandler("auditarpermisos", permission_audit_command))
     app.add_handler(CommandHandler("transferircanal", transfer_channel_command))
+    app.add_handler(CommandHandler("monetizacion", monetization_command))
+    app.add_handler(CommandHandler("publicidad", advertising_command))
+    app.add_handler(CommandHandler("paysupport", paysupport_command))
 
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     # CHAT_MEMBER no se recibe por defecto en la Bot API; run_polling usa
     # Update.ALL_TYPES abajo, así que PTB lo solicita explícitamente.
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(ChatJoinRequestHandler(on_chat_join_request))
+
+    app.add_handler(CallbackQueryHandler(monetization.money_callback, pattern=r"^money:"))
+    app.add_handler(CallbackQueryHandler(monetization.ads_callback, pattern=r"^ads:"))
+    app.add_handler(CallbackQueryHandler(monetization.opportunity_callback, pattern=r"^monopp:"))
+    app.add_handler(CallbackQueryHandler(monetization.admin_callback, pattern=r"^monadm:"))
+    app.add_handler(PreCheckoutQueryHandler(monetization.precheckout_handler))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, monetization.successful_payment_handler))
 
     app.add_handler(CallbackQueryHandler(config_link_callback, pattern=r"^cfg_link:"))
     app.add_handler(CallbackQueryHandler(config_color_callback, pattern=r"^cfg_color:"))

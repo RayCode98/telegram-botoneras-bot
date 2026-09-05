@@ -82,6 +82,13 @@ class ModerationService:
     async def handle_bot_removed(self, bot, channel: dict, actor_user_id: int | None):
         category = channel.get("category")
         owner_id = channel.get("owner_user_id")
+        previous_status = channel.get("status")
+
+        # v7 bugfix: quitar el bot de un canal que TODAVÍA NO estaba aprobado
+        # no es una infracción. Esto cubre configuring, pending_review, rejected,
+        # withdrawn, below_minimum, etc. permission_suspended conserva el carácter
+        # de canal previamente aprobado y sí se trata como participación vigente.
+        approved_participation = previous_status in {"approved", "permission_suspended"}
         # Si Telegram informa quién ejecutó la acción, se sanciona a esa persona.
         # Si no hay actor útil, recae en el responsable registrado del canal.
         responsible = actor_user_id or owner_id
@@ -94,6 +101,13 @@ class ModerationService:
 
         if category in CATEGORIES:
             await self.publisher.refresh_category(bot, category)
+
+        if not approved_participation:
+            self.db.log_system_event(
+                "bot_removed_without_violation",
+                f"chat_id={channel['chat_id']}; previous_status={previous_status}; owner={owner_id}",
+            )
+            return None
 
         return await self.register_violation(
             bot,

@@ -246,6 +246,126 @@ CREATE TABLE IF NOT EXISTS system_events (
 );
 CREATE INDEX IF NOT EXISTS idx_system_events_created ON system_events(created_at DESC);
 
+-- v7: monetización con Telegram Stars ---------------------------------
+CREATE TABLE IF NOT EXISTS monetization_profiles (
+    user_id INTEGER PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    opportunity_notifications INTEGER NOT NULL DEFAULT 1,
+    accepted_terms_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sponsored_campaigns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    advertiser_user_id INTEGER NOT NULL,
+    target_chat_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    goal_members INTEGER NOT NULL,
+    stars_price INTEGER NOT NULL,
+    platform_fee_bps INTEGER NOT NULL DEFAULT 2000,
+    participant_pool_milli INTEGER NOT NULL DEFAULT 0,
+    rate_milli_per_verified INTEGER NOT NULL DEFAULT 0,
+    entry_mode TEXT NOT NULL DEFAULT 'approval',
+    status TEXT NOT NULL DEFAULT 'awaiting_payment',
+    invoice_payload TEXT NOT NULL UNIQUE,
+    telegram_payment_charge_id TEXT,
+    paid_at TEXT,
+    admin_user_id INTEGER,
+    approved_at TEXT,
+    scheduled_at TEXT,
+    started_at TEXT,
+    max_end_at TEXT,
+    acquisition_closed_at TEXT,
+    completed_at TEXT,
+    refunded_at TEXT,
+    rejection_reason TEXT,
+    requests_count INTEGER NOT NULL DEFAULT 0,
+    request_attempts_count INTEGER NOT NULL DEFAULT 0,
+    joined_count INTEGER NOT NULL DEFAULT 0,
+    verified_count INTEGER NOT NULL DEFAULT 0,
+    rejected_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sponsored_campaign_status ON sponsored_campaigns(status, scheduled_at, max_end_at);
+CREATE INDEX IF NOT EXISTS idx_sponsored_campaign_advertiser ON sponsored_campaigns(advertiser_user_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS sponsored_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id INTEGER NOT NULL,
+    source_chat_id INTEGER NOT NULL,
+    source_owner_user_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'selected',
+    invite_link TEXT,
+    invite_link_name TEXT,
+    request_count INTEGER NOT NULL DEFAULT 0,
+    request_attempts_count INTEGER NOT NULL DEFAULT 0,
+    joined_count INTEGER NOT NULL DEFAULT 0,
+    verified_count INTEGER NOT NULL DEFAULT 0,
+    rejected_count INTEGER NOT NULL DEFAULT 0,
+    earned_milli INTEGER NOT NULL DEFAULT 0,
+    link_revoked_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(campaign_id, source_chat_id),
+    FOREIGN KEY(campaign_id) REFERENCES sponsored_campaigns(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sponsored_source_link ON sponsored_sources(invite_link) WHERE invite_link IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sponsored_sources_owner ON sponsored_sources(source_owner_user_id, campaign_id);
+
+CREATE TABLE IF NOT EXISTS sponsored_users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id INTEGER NOT NULL,
+    target_chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    first_source_chat_id INTEGER NOT NULL,
+    invite_link TEXT,
+    requested_at TEXT,
+    request_count INTEGER NOT NULL DEFAULT 0,
+    joined_at TEXT,
+    left_at TEXT,
+    validation_due_at TEXT,
+    status TEXT NOT NULL DEFAULT 'requested',
+    verified_at TEXT,
+    earning_milli INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(campaign_id, user_id),
+    FOREIGN KEY(campaign_id) REFERENCES sponsored_campaigns(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_sponsored_users_due ON sponsored_users(status, validation_due_at);
+CREATE INDEX IF NOT EXISTS idx_sponsored_users_lookup ON sponsored_users(target_chat_id, user_id, campaign_id);
+
+CREATE TABLE IF NOT EXISTS wallet_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    campaign_id INTEGER,
+    source_chat_id INTEGER,
+    conversion_user_id INTEGER,
+    entry_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    amount_milli INTEGER NOT NULL,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(campaign_id, conversion_user_id, entry_type)
+);
+CREATE INDEX IF NOT EXISTS idx_wallet_user ON wallet_ledger(user_id, status, id DESC);
+
+CREATE TABLE IF NOT EXISTS withdrawal_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    amount_milli INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    admin_user_id INTEGER,
+    admin_note TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_withdrawal_status ON withdrawal_requests(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_withdrawal_user ON withdrawal_requests(user_id, id DESC);
+
 """
 
 
@@ -304,6 +424,8 @@ class Database:
         self._ensure_column("channels", "permission_checked_at", "TEXT")
         self._ensure_column("channels", "owner_bound_at", "TEXT")
         self._ensure_column("board_messages", "campaign_id", "INTEGER")
+        self._ensure_column("sponsored_campaigns", "request_attempts_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("sponsored_sources", "request_attempts_count", "INTEGER NOT NULL DEFAULT 0")
         with self.connection() as conn:
             # v6.1: antes la interfaz llamaba "público/privado" al tipo de enlace.
             # Ambos modos antiguos permitían ingreso directo, por lo que se migran
@@ -1232,6 +1354,436 @@ class Database:
         return self.all(
             "SELECT * FROM board_messages WHERE campaign_id=? AND active=1 ORDER BY id",
             (campaign_id,),
+        )
+
+    # Monetization v7 ----------------------------------------------------
+    def ensure_monetization_profile(self, user_id: int):
+        now = now_iso()
+        self.execute(
+            """INSERT OR IGNORE INTO monetization_profiles(user_id, created_at, updated_at)
+               VALUES (?, ?, ?)""",
+            (user_id, now, now),
+        )
+
+    def get_monetization_profile(self, user_id: int) -> dict:
+        self.ensure_monetization_profile(user_id)
+        return self.one("SELECT * FROM monetization_profiles WHERE user_id=?", (user_id,)) or {
+            "user_id": user_id, "enabled": 0, "opportunity_notifications": 1,
+        }
+
+    def set_monetization_enabled(self, user_id: int, enabled: bool):
+        self.ensure_monetization_profile(user_id)
+        now = now_iso()
+        self.execute(
+            """UPDATE monetization_profiles SET enabled=?, accepted_terms_at=CASE WHEN ?=1 AND accepted_terms_at IS NULL THEN ? ELSE accepted_terms_at END,
+               updated_at=? WHERE user_id=?""",
+            (int(enabled), int(enabled), now, now, user_id),
+        )
+
+    def set_opportunity_notifications(self, user_id: int, enabled: bool):
+        self.ensure_monetization_profile(user_id)
+        self.execute(
+            "UPDATE monetization_profiles SET opportunity_notifications=?, updated_at=? WHERE user_id=?",
+            (int(enabled), now_iso(), user_id),
+        )
+
+    def monetization_participants(self) -> list[dict]:
+        return self.all(
+            """SELECT mp.*, u.private_chat_id, u.username, u.first_name
+               FROM monetization_profiles mp JOIN users u ON u.user_id=mp.user_id
+               WHERE mp.enabled=1 AND mp.opportunity_notifications=1"""
+        )
+
+    def eligible_monetization_channels(self, user_id: int, target_chat_id: int | None = None) -> list[dict]:
+        params: list[Any] = [user_id]
+        sql = """SELECT * FROM channels WHERE owner_user_id=? AND status='approved' AND permissions_ok=1"""
+        if target_chat_id is not None:
+            sql += " AND chat_id<>?"
+            params.append(target_chat_id)
+        sql += " ORDER BY telegram_title COLLATE NOCASE"
+        return self.all(sql, params)
+
+    def create_sponsored_campaign(
+        self, advertiser_user_id: int, target_chat_id: int, title: str, goal_members: int,
+        stars_price: int, platform_fee_bps: int, entry_mode: str, invoice_payload: str,
+    ) -> int:
+        pool_milli = (int(stars_price) * 1000 * max(0, 10000 - int(platform_fee_bps))) // 10000
+        rate_milli = max(1, pool_milli // max(1, int(goal_members)))
+        now = now_iso()
+        return self.execute(
+            """INSERT INTO sponsored_campaigns(
+                advertiser_user_id,target_chat_id,title,goal_members,stars_price,platform_fee_bps,
+                participant_pool_milli,rate_milli_per_verified,entry_mode,status,invoice_payload,created_at,updated_at
+               ) VALUES (?,?,?,?,?,?,?,?,?,'awaiting_payment',?,?,?)""",
+            (advertiser_user_id, target_chat_id, title, goal_members, stars_price,
+             platform_fee_bps, pool_milli, rate_milli, entry_mode, invoice_payload, now, now),
+        )
+
+    def get_sponsored_campaign(self, campaign_id: int) -> dict | None:
+        return self.one(
+            """SELECT sc.*, c.telegram_title AS target_title, c.owner_user_id AS target_owner_user_id,
+                      c.invite_type AS target_invite_type, c.status AS target_channel_status
+               FROM sponsored_campaigns sc LEFT JOIN channels c ON c.chat_id=sc.target_chat_id
+               WHERE sc.id=?""",
+            (campaign_id,),
+        )
+
+    def sponsored_campaign_by_payload(self, payload: str) -> dict | None:
+        return self.one("SELECT * FROM sponsored_campaigns WHERE invoice_payload=?", (payload,))
+
+    def sponsored_campaigns_for_advertiser(self, user_id: int, limit: int = 20) -> list[dict]:
+        return self.all(
+            """SELECT sc.*, c.telegram_title AS target_title FROM sponsored_campaigns sc
+               LEFT JOIN channels c ON c.chat_id=sc.target_chat_id
+               WHERE sc.advertiser_user_id=? ORDER BY sc.id DESC LIMIT ?""",
+            (user_id, limit),
+        )
+
+    def sponsored_campaigns_by_status(self, statuses: tuple[str, ...], limit: int = 100) -> list[dict]:
+        if not statuses:
+            return []
+        ph = ",".join("?" for _ in statuses)
+        return self.all(
+            f"SELECT * FROM sponsored_campaigns WHERE status IN ({ph}) ORDER BY id LIMIT ?",
+            (*statuses, limit),
+        )
+
+    def mark_sponsored_paid(self, campaign_id: int, charge_id: str, paid_at: str):
+        self.execute(
+            """UPDATE sponsored_campaigns SET status='paid_review', telegram_payment_charge_id=?, paid_at=?, updated_at=? WHERE id=?""",
+            (charge_id, paid_at, now_iso(), campaign_id),
+        )
+
+    def approve_sponsored_campaign(self, campaign_id: int, admin_user_id: int, scheduled_at: str, max_end_at: str):
+        self.execute(
+            """UPDATE sponsored_campaigns SET status='recruiting', admin_user_id=?, approved_at=?, scheduled_at=?, max_end_at=?,
+               rejection_reason=NULL, updated_at=? WHERE id=?""",
+            (admin_user_id, now_iso(), scheduled_at, max_end_at, now_iso(), campaign_id),
+        )
+
+    def reject_sponsored_campaign(self, campaign_id: int, admin_user_id: int, reason: str, refunded: bool = False):
+        status = 'refunded' if refunded else 'rejected'
+        self.execute(
+            """UPDATE sponsored_campaigns SET status=?, admin_user_id=?, rejection_reason=?, refunded_at=?, updated_at=? WHERE id=?""",
+            (status, admin_user_id, reason, now_iso() if refunded else None, now_iso(), campaign_id),
+        )
+
+    def start_sponsored_campaign(self, campaign_id: int):
+        self.execute(
+            "UPDATE sponsored_campaigns SET status='active', started_at=?, updated_at=? WHERE id=?",
+            (now_iso(), now_iso(), campaign_id),
+        )
+
+    def close_sponsored_acquisition(self, campaign_id: int, status: str = 'settling'):
+        self.execute(
+            """UPDATE sponsored_campaigns SET status=?, acquisition_closed_at=COALESCE(acquisition_closed_at,?), updated_at=? WHERE id=?""",
+            (status, now_iso(), now_iso(), campaign_id),
+        )
+
+    def complete_sponsored_campaign(self, campaign_id: int):
+        self.execute(
+            "UPDATE sponsored_campaigns SET status='completed', completed_at=?, updated_at=? WHERE id=?",
+            (now_iso(), now_iso(), campaign_id),
+        )
+
+    def recruiting_sponsored_due(self, now_value: str) -> list[dict]:
+        return self.all(
+            "SELECT * FROM sponsored_campaigns WHERE status='recruiting' AND scheduled_at IS NOT NULL AND scheduled_at<=? ORDER BY id",
+            (now_value,),
+        )
+
+    def active_sponsored_campaigns(self) -> list[dict]:
+        return self.all("SELECT * FROM sponsored_campaigns WHERE status IN ('active','settling') ORDER BY id")
+
+    def upsert_sponsored_source(self, campaign_id: int, source_chat_id: int, owner_user_id: int, selected: bool = True):
+        now = now_iso()
+        status = 'selected' if selected else 'declined'
+        self.execute(
+            """INSERT INTO sponsored_sources(campaign_id,source_chat_id,source_owner_user_id,status,created_at,updated_at)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(campaign_id,source_chat_id) DO UPDATE SET source_owner_user_id=excluded.source_owner_user_id,
+               status=excluded.status, updated_at=excluded.updated_at""",
+            (campaign_id, source_chat_id, owner_user_id, status, now, now),
+        )
+
+    def sponsored_source(self, campaign_id: int, source_chat_id: int) -> dict | None:
+        return self.one(
+            "SELECT * FROM sponsored_sources WHERE campaign_id=? AND source_chat_id=?",
+            (campaign_id, source_chat_id),
+        )
+
+    def sponsored_sources(self, campaign_id: int, statuses: tuple[str, ...] | None = None) -> list[dict]:
+        if statuses:
+            ph = ",".join("?" for _ in statuses)
+            return self.all(
+                f"""SELECT ss.*, c.telegram_title AS source_title, c.status AS channel_status
+                    FROM sponsored_sources ss LEFT JOIN channels c ON c.chat_id=ss.source_chat_id
+                    WHERE ss.campaign_id=? AND ss.status IN ({ph}) ORDER BY ss.id""",
+                (campaign_id, *statuses),
+            )
+        return self.all(
+            """SELECT ss.*, c.telegram_title AS source_title, c.status AS channel_status
+               FROM sponsored_sources ss LEFT JOIN channels c ON c.chat_id=ss.source_chat_id
+               WHERE ss.campaign_id=? ORDER BY ss.id""",
+            (campaign_id,),
+        )
+
+    def selected_sponsored_sources_for_owner(self, campaign_id: int, user_id: int) -> list[dict]:
+        return self.all(
+            "SELECT * FROM sponsored_sources WHERE campaign_id=? AND source_owner_user_id=? AND status IN ('selected','active')",
+            (campaign_id, user_id),
+        )
+
+    def set_sponsored_source_link(self, campaign_id: int, source_chat_id: int, invite_link: str, link_name: str):
+        self.execute(
+            """UPDATE sponsored_sources SET status='active', invite_link=?, invite_link_name=?, updated_at=?
+               WHERE campaign_id=? AND source_chat_id=?""",
+            (invite_link, link_name, now_iso(), campaign_id, source_chat_id),
+        )
+
+    def mark_sponsored_source_revoked(self, campaign_id: int, source_chat_id: int):
+        self.execute(
+            """UPDATE sponsored_sources SET link_revoked_at=?, status=CASE WHEN status='active' THEN 'closed' ELSE status END,
+               updated_at=? WHERE campaign_id=? AND source_chat_id=?""",
+            (now_iso(), now_iso(), campaign_id, source_chat_id),
+        )
+
+    def sponsored_source_by_link(self, invite_link: str) -> dict | None:
+        return self.one(
+            """SELECT ss.*, sc.target_chat_id, sc.status AS campaign_status, sc.goal_members,
+                      sc.rate_milli_per_verified, sc.entry_mode
+               FROM sponsored_sources ss JOIN sponsored_campaigns sc ON sc.id=ss.campaign_id
+               WHERE ss.invite_link=?""",
+            (invite_link,),
+        )
+
+    def active_sponsored_buttons_for_source(self, source_chat_id: int) -> list[dict]:
+        return self.all(
+            """SELECT ss.*, sc.title, sc.target_chat_id, sc.id AS sponsored_campaign_id
+               FROM sponsored_sources ss JOIN sponsored_campaigns sc ON sc.id=ss.campaign_id
+               WHERE ss.source_chat_id=? AND ss.status='active' AND sc.status='active' AND ss.invite_link IS NOT NULL
+               ORDER BY sc.id""",
+            (source_chat_id,),
+        )
+
+    def active_sponsored_sources_for_chat(self, source_chat_id: int) -> list[dict]:
+        return self.all(
+            """SELECT ss.*, sc.target_chat_id, sc.title, sc.status AS campaign_status
+               FROM sponsored_sources ss JOIN sponsored_campaigns sc ON sc.id=ss.campaign_id
+               WHERE ss.source_chat_id=? AND ss.status='active' AND sc.status='active'
+               ORDER BY ss.campaign_id""",
+            (source_chat_id,),
+        )
+
+    def record_sponsored_request(self, invite_link: str, user_id: int, requested_at: str) -> dict | None:
+        source = self.sponsored_source_by_link(invite_link)
+        if not source or source.get('campaign_status') != 'active':
+            return None
+        cid = int(source['campaign_id'])
+        existing = self.one("SELECT * FROM sponsored_users WHERE campaign_id=? AND user_id=?", (cid, user_id))
+        now = now_iso()
+        if existing:
+            self.execute(
+                "UPDATE sponsored_users SET request_count=COALESCE(request_count,0)+1, requested_at=COALESCE(requested_at,?), updated_at=? WHERE id=?",
+                (requested_at, now, existing['id']),
+            )
+        else:
+            self.execute(
+                """INSERT INTO sponsored_users(campaign_id,target_chat_id,user_id,first_source_chat_id,invite_link,requested_at,request_count,status,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,1,'requested',?,?)""",
+                (cid, source['target_chat_id'], user_id, source['source_chat_id'], invite_link, requested_at, now, now),
+            )
+        self.refresh_sponsored_counters(cid)
+        return self.one("SELECT * FROM sponsored_users WHERE campaign_id=? AND user_id=?", (cid, user_id))
+
+    def record_sponsored_join(self, invite_link: str, user_id: int, joined_at: str, validation_due_at: str) -> dict | None:
+        source = self.sponsored_source_by_link(invite_link)
+        if not source or source.get('campaign_status') != 'active':
+            return None
+        cid = int(source['campaign_id'])
+        existing = self.one("SELECT * FROM sponsored_users WHERE campaign_id=? AND user_id=?", (cid, user_id))
+        now = now_iso()
+        if existing:
+            # First-touch attribution: no se cambia first_source_chat_id aunque pulse otro enlace después.
+            self.execute(
+                """UPDATE sponsored_users SET joined_at=COALESCE(joined_at,?), left_at=NULL, validation_due_at=COALESCE(validation_due_at,?),
+                   status=CASE WHEN status IN ('verified','rejected') THEN status ELSE 'joined' END, updated_at=? WHERE id=?""",
+                (joined_at, validation_due_at, now, existing['id']),
+            )
+        else:
+            self.execute(
+                """INSERT INTO sponsored_users(campaign_id,target_chat_id,user_id,first_source_chat_id,invite_link,joined_at,validation_due_at,status,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,'joined',?,?)""",
+                (cid, source['target_chat_id'], user_id, source['source_chat_id'], invite_link, joined_at, validation_due_at, now, now),
+            )
+        self.refresh_sponsored_counters(cid)
+        return self.one("SELECT * FROM sponsored_users WHERE campaign_id=? AND user_id=?", (cid, user_id))
+
+    def record_sponsored_join_from_pending(self, target_chat_id: int, user_id: int, joined_at: str, validation_due_at: str) -> dict | None:
+        row = self.one(
+            """SELECT su.invite_link FROM sponsored_users su JOIN sponsored_campaigns sc ON sc.id=su.campaign_id
+               WHERE su.target_chat_id=? AND su.user_id=? AND sc.status='active' AND su.requested_at IS NOT NULL
+               ORDER BY su.id DESC LIMIT 1""",
+            (target_chat_id, user_id),
+        )
+        if not row or not row.get('invite_link'):
+            return None
+        return self.record_sponsored_join(row['invite_link'], user_id, joined_at, validation_due_at)
+
+    def record_sponsored_leave(self, target_chat_id: int, user_id: int, left_at: str):
+        row = self.one(
+            """SELECT su.* FROM sponsored_users su JOIN sponsored_campaigns sc ON sc.id=su.campaign_id
+               WHERE su.target_chat_id=? AND su.user_id=? AND sc.status IN ('active','settling')
+               ORDER BY su.id DESC LIMIT 1""",
+            (target_chat_id, user_id),
+        )
+        if not row:
+            return
+        status = row.get('status')
+        new_status = 'rejected' if status in {'requested','joined'} else status
+        self.execute(
+            "UPDATE sponsored_users SET left_at=?, status=?, updated_at=? WHERE id=?",
+            (left_at, new_status, now_iso(), row['id']),
+        )
+        if status in {'requested','joined'}:
+            self.execute(
+                "UPDATE wallet_ledger SET status='void', updated_at=? WHERE campaign_id=? AND conversion_user_id=? AND entry_type='earning' AND status='pending'",
+                (now_iso(), row['campaign_id'], user_id),
+            )
+        self.refresh_sponsored_counters(row['campaign_id'])
+
+    def ensure_pending_earning(self, campaign_id: int, source_chat_id: int, conversion_user_id: int, owner_user_id: int, amount_milli: int):
+        now = now_iso()
+        self.execute(
+            """INSERT OR IGNORE INTO wallet_ledger(user_id,campaign_id,source_chat_id,conversion_user_id,entry_type,status,amount_milli,note,created_at,updated_at)
+               VALUES (?,?,?,?, 'earning','pending',?,'Conversión pendiente de retención',?,?)""",
+            (owner_user_id, campaign_id, source_chat_id, conversion_user_id, amount_milli, now, now),
+        )
+
+    def pending_sponsored_validations(self, now_value: str, limit: int = 200) -> list[dict]:
+        return self.all(
+            """SELECT su.*, sc.rate_milli_per_verified, sc.target_chat_id AS campaign_target_chat_id,
+                      ss.source_owner_user_id
+               FROM sponsored_users su
+               JOIN sponsored_campaigns sc ON sc.id=su.campaign_id
+               JOIN sponsored_sources ss ON ss.campaign_id=su.campaign_id AND ss.source_chat_id=su.first_source_chat_id
+               WHERE su.status='joined' AND su.validation_due_at IS NOT NULL AND su.validation_due_at<=?
+               ORDER BY su.validation_due_at LIMIT ?""",
+            (now_value, limit),
+        )
+
+    def mark_sponsored_verified(self, campaign_id: int, user_id: int, earning_milli: int):
+        now = now_iso()
+        self.execute(
+            """UPDATE sponsored_users SET status='verified', verified_at=?, earning_milli=?, updated_at=?
+               WHERE campaign_id=? AND user_id=? AND status='joined'""",
+            (now, earning_milli, now, campaign_id, user_id),
+        )
+        self.execute(
+            """UPDATE wallet_ledger SET status='available', amount_milli=?, note='Conversión verificada', updated_at=?
+               WHERE campaign_id=? AND conversion_user_id=? AND entry_type='earning' AND status='pending'""",
+            (earning_milli, now, campaign_id, user_id),
+        )
+        self.refresh_sponsored_counters(campaign_id)
+
+    def mark_sponsored_rejected(self, campaign_id: int, user_id: int, reason: str):
+        now = now_iso()
+        self.execute(
+            """UPDATE sponsored_users SET status='rejected', updated_at=? WHERE campaign_id=? AND user_id=? AND status<>'verified'""",
+            (now, campaign_id, user_id),
+        )
+        self.execute(
+            """UPDATE wallet_ledger SET status='void', note=?, updated_at=?
+               WHERE campaign_id=? AND conversion_user_id=? AND entry_type='earning' AND status='pending'""",
+            (reason[:300], now, campaign_id, user_id),
+        )
+        self.refresh_sponsored_counters(campaign_id)
+
+    def refresh_sponsored_counters(self, campaign_id: int):
+        c = self.one(
+            """SELECT COUNT(CASE WHEN requested_at IS NOT NULL THEN 1 END) requests_count,
+                      COALESCE(SUM(request_count),0) request_attempts_count,
+                      COUNT(CASE WHEN joined_at IS NOT NULL THEN 1 END) joined_count,
+                      COUNT(CASE WHEN status='verified' THEN 1 END) verified_count,
+                      COUNT(CASE WHEN status='rejected' THEN 1 END) rejected_count
+               FROM sponsored_users WHERE campaign_id=?""",
+            (campaign_id,),
+        ) or {}
+        self.execute(
+            """UPDATE sponsored_campaigns SET requests_count=?, request_attempts_count=?, joined_count=?, verified_count=?, rejected_count=?, updated_at=? WHERE id=?""",
+            (int(c.get('requests_count') or 0), int(c.get('request_attempts_count') or 0), int(c.get('joined_count') or 0),
+             int(c.get('verified_count') or 0), int(c.get('rejected_count') or 0), now_iso(), campaign_id),
+        )
+        for src in self.sponsored_sources(campaign_id):
+            sc = self.one(
+                """SELECT COUNT(CASE WHEN requested_at IS NOT NULL THEN 1 END) request_count,
+                          COALESCE(SUM(request_count),0) request_attempts_count,
+                          COUNT(CASE WHEN joined_at IS NOT NULL THEN 1 END) joined_count,
+                          COUNT(CASE WHEN status='verified' THEN 1 END) verified_count,
+                          COUNT(CASE WHEN status='rejected' THEN 1 END) rejected_count,
+                          COALESCE(SUM(CASE WHEN status='verified' THEN earning_milli ELSE 0 END),0) earned_milli
+                   FROM sponsored_users WHERE campaign_id=? AND first_source_chat_id=?""",
+                (campaign_id, src['source_chat_id']),
+            ) or {}
+            self.execute(
+                """UPDATE sponsored_sources SET request_count=?, request_attempts_count=?, joined_count=?, verified_count=?, rejected_count=?, earned_milli=?, updated_at=?
+                   WHERE campaign_id=? AND source_chat_id=?""",
+                (int(sc.get('request_count') or 0), int(sc.get('request_attempts_count') or 0), int(sc.get('joined_count') or 0),
+                 int(sc.get('verified_count') or 0), int(sc.get('rejected_count') or 0), int(sc.get('earned_milli') or 0), now_iso(), campaign_id, src['source_chat_id']),
+            )
+
+    def sponsored_campaign_pending_count(self, campaign_id: int) -> int:
+        row = self.one(
+            "SELECT COUNT(*) n FROM sponsored_users WHERE campaign_id=? AND status='joined'",
+            (campaign_id,),
+        )
+        return int((row or {}).get('n') or 0)
+
+    def wallet_summary(self, user_id: int) -> dict:
+        row = self.one(
+            """SELECT COALESCE(SUM(CASE WHEN status='available' THEN amount_milli ELSE 0 END),0) available_milli,
+                      COALESCE(SUM(CASE WHEN status='pending' THEN amount_milli ELSE 0 END),0) pending_milli,
+                      COALESCE(SUM(CASE WHEN status IN ('available','paid') AND entry_type='earning' THEN amount_milli ELSE 0 END),0) historical_milli
+               FROM wallet_ledger WHERE user_id=?""",
+            (user_id,),
+        ) or {}
+        withdrawals = self.one(
+            """SELECT COALESCE(SUM(CASE WHEN status IN ('pending','paid') THEN amount_milli ELSE 0 END),0) reserved_milli,
+                      COALESCE(SUM(CASE WHEN status='paid' THEN amount_milli ELSE 0 END),0) paid_milli
+               FROM withdrawal_requests WHERE user_id=?""",
+            (user_id,),
+        ) or {}
+        available = max(0, int(row.get('available_milli') or 0) - int(withdrawals.get('reserved_milli') or 0))
+        return {
+            'available_milli': available,
+            'pending_milli': int(row.get('pending_milli') or 0),
+            'historical_milli': int(row.get('historical_milli') or 0),
+            'withdrawn_milli': int(withdrawals.get('paid_milli') or 0),
+        }
+
+    def create_withdrawal_request(self, user_id: int, amount_milli: int) -> int:
+        now = now_iso()
+        return self.execute(
+            "INSERT INTO withdrawal_requests(user_id,amount_milli,status,created_at) VALUES (?,?,'pending',?)",
+            (user_id, amount_milli, now),
+        )
+
+    def pending_withdrawals(self, limit: int = 50) -> list[dict]:
+        return self.all(
+            """SELECT wr.*, u.username, u.first_name FROM withdrawal_requests wr
+               LEFT JOIN users u ON u.user_id=wr.user_id WHERE wr.status='pending' ORDER BY wr.id LIMIT ?""",
+            (limit,),
+        )
+
+    def get_withdrawal(self, withdrawal_id: int) -> dict | None:
+        return self.one("SELECT * FROM withdrawal_requests WHERE id=?", (withdrawal_id,))
+
+    def resolve_withdrawal(self, withdrawal_id: int, admin_user_id: int, status: str, note: str | None = None):
+        if status not in {'paid','rejected'}:
+            raise ValueError('Estado de retiro inválido')
+        self.execute(
+            "UPDATE withdrawal_requests SET status=?, admin_user_id=?, admin_note=?, resolved_at=? WHERE id=?",
+            (status, admin_user_id, note, now_iso(), withdrawal_id),
         )
 
     # Sessions ----------------------------------------------------------

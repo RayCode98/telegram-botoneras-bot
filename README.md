@@ -1,12 +1,14 @@
-# Telegram Botoneras v6.1
+# Telegram Botoneras v7.0.0
 
-Bot en Python para administrar publicaciones programadas de intercambio de canales de Telegram con categorías, revisión, estadísticas, mezcla periódica, sanciones, panel de participantes y herramientas de robustez/operación.
+Bot en Python para gestionar botoneras programadas de Telegram y un módulo opcional de campañas patrocinadas pagadas con Telegram Stars.
+
+La v7 conserva todas las funciones anteriores: categorías 5K/10K/20K/30K/+50K, panel de participantes y administradores, enlaces directos o con solicitud de ingreso, verificación manual de canales, publicación/eliminación programada, una columna de botones, shuffle, estadísticas, recategorización, sanciones, apelaciones, backups, health check, auditoría de permisos y protección de propiedad.
 
 ## Requisitos
 
 - Python 3.11+
 - `python-telegram-bot[job-queue]==22.8`
-- Bot creado con @BotFather
+- Bot creado con BotFather
 - SQLite (incluido en Python)
 
 ## Instalación
@@ -21,521 +23,444 @@ Windows:
 .venv\Scripts\activate
 ```
 
-Linux/macOS:
+Linux:
 
 ```bash
 source .venv/bin/activate
 ```
 
-Instala dependencias:
+Después:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Copia `.env.example` a `.env` y configura tu token y administradores:
-
-```env
-BOT_TOKEN=TU_TOKEN
-ADMIN_IDS=123456789
-TIMEZONE=America/Mexico_City
-DATABASE_PATH=botoneras.sqlite3
-DISTRIBUTE_MODE=category
-MAX_BUTTONS_PER_BOARD=100
-MIN_MEMBERS=5000
-DEFAULT_POST_LIFETIME_HOURS=6
-VIOLATION_LIMIT=3
-INTEGRITY_CHECK_SECONDS=300
-CLEANUP_CHECK_SECONDS=60
-CATEGORY_CHECK_SECONDS=900
-UPCOMING_NOTICE_MINUTES=30
-LEAVE_CHANNELS_ON_BAN=true
-BACKUP_ENABLED=true
-BACKUP_DIR=backups
-BACKUP_HOUR=3
-BACKUP_MINUTE=30
-BACKUP_RETENTION_DAYS=14
-PERMISSION_CHECK_SECONDS=900
-```
-
-Ejecuta:
+Copia `.env.example` como `.env`, configura `BOT_TOKEN` y `ADMIN_IDS`, y ejecuta:
 
 ```bash
 python main.py
 ```
 
-## Panel del participante
+## Actualizar desde v6.2
 
-El participante abre `/start`, `/miperfil` o `/inicio`.
-
-El panel incluye:
-
-- 📡 Mis canales
-- 📊 Estadísticas
-- ➕ Agregar canal
-- ✅ Verificación manual de un canal cuando el alta automática no llega
-- 🕐 Próximas botoneras
-- ⚠️ Mi estado
-- 🔔 Notificaciones
-- ℹ️ Ayuda
-
-Los administradores también ven un botón para entrar al panel administrativo.
-
-### Alta de un canal
-
-1. El usuario debe haber iniciado el bot con `/start`.
-2. En `➕ Agregar canal`, pulsa `Agregar bot a un canal`.
-3. Telegram abre el selector de canales y solicita los permisos necesarios.
-4. Al convertirse el bot en administrador, `my_chat_member` intenta registrar el canal y al responsable automáticamente.
-5. Si esa actualización no llega o se perdió, el usuario puede pulsar **Ya lo agregué · Verificar manualmente** o ejecutar `/verificarcanal`. Telegram abre su selector nativo de canales y el bot vuelve a comprobar directamente el `chat_id`, al usuario administrador y sus propios permisos.
-6. El participante elige ingreso directo/solicitud de ingreso, título y color.
-7. La solicitud pasa a revisión.
-8. Al aprobarse, el botón entra en su categoría.
-
-### Edición
-
-Título, color y enlace se pueden modificar desde el detalle del canal. Cualquier cambio vuelve a `pending_review`; el canal queda fuera de la botonera hasta nueva aprobación.
-
-### Retiro voluntario
-
-El dueño puede retirar su canal desde el panel. El bot:
-
-- cambia el estado a `withdrawn`;
-- elimina las publicaciones activas de ese canal que pueda borrar;
-- quita su botón de las botoneras activas de su categoría;
-- no registra ninguna falta.
-
-Si después el dueño elimina el bot del canal estando en estado `withdrawn`, tampoco se genera una falta.
-
-## Estadísticas
-
-Cada copia de una botonera guarda el número de suscriptores al inicio. Al terminar por expiración o eliminación administrativa global, se vuelve a consultar el total y se calcula:
-
-```text
-inicio → final = diferencia
-```
-
-El participante puede consultar:
-
-- participaciones de los últimos 30 días;
-- crecimiento neto;
-- promedio;
-- mejor resultado;
-- peor resultado;
-- historial paginado por canal.
-
-## Categorías
-
-Clasificación predeterminada:
-
-- `5K`: 5,000–9,999
-- `10K`: 10,000–19,999
-- `20K`: 20,000–29,999
-- `30K`: 30,000–49,999
-- `+50K`: 50,000+
-
-`CATEGORY_CHECK_SECONDS` controla cada cuánto se revisan los suscriptores. Si un canal cruza un límite mientras una campaña está activa, la nueva categoría queda pendiente y se aplica cuando ya no altere la campaña en curso.
-
-Si cae por debajo de `MIN_MEMBERS`, pasa a `below_minimum`, deja de participar y continúa siendo revisado para reincorporarse automáticamente.
-
-## Progreso de categoría
-
-Desde cada canal se muestra una barra de progreso, siguiente categoría, meta de suscriptores y cuántos faltan.
-
-## Próximas botoneras
-
-El participante puede consultar el próximo horario, duración y mezcla de su categoría. Si la publicación ya está activa, se muestra su expiración.
-
-Además existe un recordatorio automático antes del inicio:
-
-```env
-UPCOMING_NOTICE_MINUTES=30
-```
-
-Los avisos se guardan en `notification_log`, por lo que un reinicio no duplica el mismo recordatorio.
-
-## Notificaciones
-
-Cada participante puede activar/desactivar:
-
-- aprobación;
-- rechazo;
-- inicio;
-- finalización;
-- estadísticas;
-- cambio de categoría;
-- recordatorio de próxima botonera.
-
-Las alertas de seguridad son obligatorias.
-
-## Sistema de faltas
-
-Se mantiene el sistema de sanciones de v4. Por defecto:
-
-```env
-VIOLATION_LIMIT=3
-```
-
-Al alcanzar el límite se bloquea al usuario para nuevas altas/modificaciones y sus canales se retiran del sistema según la configuración.
-
-El participante puede ver su estado e historial de incidencias.
-
-## Apelaciones
-
-Desde `⚠️ Mi estado → 📨 Solicitar revisión` se envía una explicación al administrador.
-
-En `🛡 Panel administrativo → 📨 Apelaciones`, el administrador puede:
-
-- retirar una falta;
-- desbloquear y resetear todas las faltas;
-- rechazar la apelación.
-
-Solo puede existir una apelación pendiente por usuario.
-
-## Panel administrativo
-
-Mantiene las funciones de v4:
-
-- 📣 Publicaciones
-- 🖼 Plantillas
-- ⏰ Horarios
-- ⌛ Duración
-- 🔀 Mezcla
-- 📡 Canales
-- ✅ Pendientes
-- 🔘 Botones manuales
-- 🚫 Sanciones
-- 📨 Apelaciones
-- 🩺 Sistema / mantenimiento
-- 👤 Mi panel
-
-## Publicación
-
-Cada categoría tiene imagen, texto y botones en una sola columna.
-
-Los botones de canales pueden mezclarse periódicamente. Los botones manuales del administrador nunca participan en la mezcla y mantienen su orden.
-
-## Eliminación
-
-Las publicaciones pueden:
-
-- expirar automáticamente según la duración;
-- borrarse manualmente de todos los canales desde el panel o `/eliminarpublicacion CATEGORIA`.
-
-El sistema mantiene los registros que Telegram no pudo borrar para permitir reintentos.
-
-## Mantenimiento y robustez (v6)
-
-### Backups automáticos
-
-Si `BACKUP_ENABLED=true`, el bot crea diariamente una instantánea consistente de SQLite a la hora definida por `BACKUP_HOUR` y `BACKUP_MINUTE`. Usa la Online Backup API de SQLite, por lo que no copia a ciegas un archivo que pueda estar siendo escrito.
-
-- `/backup`: crea un backup manual.
-- `BACKUP_DIR`: carpeta de destino.
-- `BACKUP_RETENTION_DAYS`: elimina automáticamente snapshots antiguos.
-- Cada snapshot ejecuta `PRAGMA quick_check` antes de considerarse válido.
-
-Desde `/panel → 🩺 Sistema` también puede crearse un backup manual.
-
-### Health check
-
-`/health` o `/panel → 🩺 Sistema → Health check` muestra:
-
-- conexión con Telegram;
-- `PRAGMA quick_check` de SQLite;
-- cantidad de jobs programados;
-- uptime del proceso;
-- canales aprobados;
-- canales suspendidos por permisos;
-- publicaciones activas;
-- último backup;
-- errores recientes;
-- conflictos recientes de propiedad.
-
-### Auditoría preventiva de permisos
-
-El bot revisa periódicamente que conserve en cada canal los permisos necesarios para:
-
-- publicar mensajes;
-- editar mensajes;
-- eliminar mensajes;
-- invitar usuarios / generar enlaces.
-
-Además, vuelve a validar los permisos inmediatamente antes de publicar cada botonera. Si faltan permisos, el canal pasa a `permission_suspended`, no recibe nuevas publicaciones y el propietario es avisado. Esto **no genera una falta**. Cuando los permisos vuelven a estar correctos, el sistema lo reactiva automáticamente.
-
-Comando manual: `/auditarpermisos`.
-
-### Protección contra canales duplicados / apropiación
-
-El `chat_id` de un canal queda ligado al primer propietario registrado. Si otra cuenta intenta agregar nuevamente el bot para reclamar ese mismo canal:
-
-- no se cambia el propietario;
-- se registra un conflicto;
-- se avisa al propietario original y a los administradores;
-- el bot abandona esa alta conflictiva.
-
-Para una transferencia legítima, el nuevo propietario debe ejecutar `/start` y un administrador usa:
-
-```text
-/transferircanal CHAT_ID USER_ID
-```
-
-La transferencia deja el canal en `pending_review` antes de volver a participar.
-
-## Migrar desde v5
-
-Haz respaldo de:
+Haz un respaldo de:
 
 ```text
 .env
 botoneras.sqlite3
 ```
 
-Reemplaza el código por v6, conserva tu `.env` y agrega las variables nuevas de backup/permisos si deseas personalizarlas. No borres `botoneras.sqlite3`: la migración agrega automáticamente las nuevas columnas/tablas.
+Reemplaza el código por v7 y conserva tu base. **No borres `botoneras.sqlite3`.** La migración se ejecuta automáticamente al iniciar.
 
-## Archivos principales
+Añade o revisa estas variables:
 
-```text
-bot/
-  app.py
-  config.py
-  db.py
-  keyboards.py
-  moderation.py
-  publisher.py
-  maintenance.py
-main.py
-requirements.txt
-.env.example
-CHANGELOG_v6.md
-README.md
+```env
+MONETIZATION_ENABLED=true
+MONETIZATION_STARS_PER_1000=300
+MONETIZATION_PLATFORM_FEE_BPS=2000
+MONETIZATION_RETENTION_HOURS=24
+MONETIZATION_OPPORTUNITY_HOURS=3
+MONETIZATION_MAX_CAMPAIGN_HOURS=72
+MONETIZATION_MIN_WITHDRAW_STARS=10
+MONETIZATION_GOALS=1000,2000,5000
 ```
 
+El valor de 300 Stars por 1K es un valor inicial de configuración, no una equivalencia fija a dólares.
 
-## v6.1 — Enlaces de ingreso y verificación manual
+---
 
-### Ingreso directo vs solicitud de ingreso
+# 1. Botoneras normales
 
-La configuración de enlace ya no significa público/privado. Ahora significa:
+Las publicaciones continúan funcionando con:
 
-- **🚪 Ingreso directo**: `creates_join_request=False`. Quien pulse el botón puede entrar mediante ese enlace sin aprobación previa.
-- **🛂 Solicitud de ingreso**: `creates_join_request=True`. Quien pulse el botón genera una solicitud que debe ser aprobada por un administrador del canal.
+- una imagen;
+- texto HTML compatible con Telegram;
+- botones en una sola columna;
+- categorías 5K, 10K, 20K, 30K y +50K;
+- publicación programada;
+- duración configurable y eliminación automática;
+- eliminación manual global;
+- refresco de posts activos;
+- mezcla periódica solo de botones de canales;
+- botones manuales del administrador fuera del shuffle;
+- estadísticas de inicio/fin;
+- enlaces de atribución por campaña normal;
+- recategorización automática.
 
-El bot genera un enlace de invitación propio en ambos casos. Para hacerlo necesita el permiso **Invitar usuarios**.
+## Enlaces de canal
 
-> Nota: si el canal tiene un `@username` público, seguirá existiendo la posibilidad de encontrar/abrir el canal mediante ese enlace público fuera de la botonera. El enlace generado por el bot sí respetará el modo elegido. Para exigir aprobación como única vía de entrada, el canal debe ser privado en Telegram.
+El propietario elige:
 
-### Recuperar un canal que no fue detectado
+- `🚪 Ingreso directo`
+- `🛂 Solicitud de ingreso`
 
-Si el bot aparece como administrador pero nunca llegó el mensaje de confirmación:
+No significa público/privado. Describe si el enlace permite entrar directamente o crea una solicitud que requiere aprobación.
 
-1. Abre el bot en privado.
-2. Entra a `➕ Agregar canal`.
-3. Pulsa `✅ Ya lo agregué · Verificar manualmente`.
-4. Telegram mostrará el selector nativo de canales.
-5. Selecciona el canal.
-6. El bot comprueba en tiempo real:
-   - que el chat sea un canal;
-   - que el bot sea administrador;
-   - que tenga publicar, editar, eliminar e invitar;
-   - que el usuario que lo está verificando sea propietario/administrador;
-   - que el canal no pertenezca ya a otro participante.
-7. Si todo está correcto, continúa con ingreso directo/solicitud, título, color y revisión administrativa.
+## Verificación manual
 
-También puede abrirse directamente con:
+Si Telegram no entrega correctamente el evento de alta del bot:
 
 ```text
 /verificarcanal
 ```
 
-Esta vía no depende de recibir de nuevo `my_chat_member`, por lo que sirve para canales que ya tenían al bot como administrador antes de que el sistema registrara correctamente el alta.
+El usuario selecciona el canal mediante el selector nativo de Telegram y el bot comprueba propiedad/admin, permisos y registro existente.
 
 ---
 
-## v6.2 — Campañas con enlaces exclusivos y estadísticas atribuibles
+# 2. Corrección de sanciones v7
 
-Desde v6.2 una botonera ya no usa el enlace permanente del canal para medir resultados. Cada ejecución crea una **campaña** y genera un enlace independiente para cada canal que aparece como botón.
+Eliminar el bot de un canal que aún **no fue aprobado** no suma ninguna falta.
+
+Solo se puede registrar `bot_removed` si el canal estaba:
+
+```text
+approved
+permission_suspended
+```
+
+Por ejemplo, estos estados no generan falta al quitar el bot:
+
+```text
+configuring
+pending_review
+rejected
+withdrawn
+inactive
+below_minimum
+```
+
+---
+
+# 3. Monetización para participantes
+
+Acceso:
+
+```text
+/monetizacion
+```
+
+o desde:
+
+```text
+/start → 💰 Monetización
+```
+
+El usuario debe activar voluntariamente la monetización y aceptar las reglas básicas.
+
+## Oportunidades
+
+Cuando un administrador aprueba una campaña pagada, por defecto se programa para comenzar dentro de 3 horas. Los usuarios monetizados con canales elegibles reciben una oportunidad.
 
 Ejemplo:
 
 ```text
-Campaña #214 · 10K
-├─ Canal A → enlace exclusivo campaña #214
-├─ Canal B → enlace exclusivo campaña #214
-└─ Canal C → enlace exclusivo campaña #214
+💰 Nueva oportunidad · Campaña #31
+
+Canal promocionado: Noticias Premium
+Objetivo: 1,000 miembros
+Pool participantes: 240 créditos internos
+Retención requerida: 24h
+
+[ Canal A ]
+[ Canal B ]
+[ Confirmar participación ]
+[ No participar ]
 ```
 
-Los botones manuales agregados por un administrador no cambian y siguen fuera de la medición/mezcla de canales.
+Participar es opcional y el usuario elige sus canales fuente.
 
-### Solicitud de ingreso
+---
 
-Si el canal tiene configurado:
+# 4. Publicidad / anunciantes
+
+Acceso:
 
 ```text
-🛂 Solicitud de ingreso
+/publicidad
 ```
 
-el enlace de esa campaña se crea con:
-
-```python
-creates_join_request=True
-```
-
-y expira cuando termina la publicación.
-
-El bot recibe `chat_join_request`, reconoce el `invite_link` utilizado y registra la solicitud dentro de esa campaña. La clave lógica de una solicitud única es:
+Flujo:
 
 ```text
-campaign_id + channel_chat_id + telegram_user_id
+Seleccionar canal objetivo
+→ elegir meta
+→ pagar con Telegram Stars
+→ pago confirmado
+→ revisión administrativa
+→ reclutamiento de participantes
+→ campaña activa
+→ meta de ingresos
+→ validar retención
+→ resultados
 ```
 
-Por eso si una persona manda dos veces la solicitud durante la misma campaña se obtiene, por ejemplo:
+Los objetivos disponibles se configuran con `MONETIZATION_GOALS`.
+
+## Telegram Stars
+
+La factura utiliza:
 
 ```text
-Solicitudes únicas: 1
-Intentos de solicitud: 2
+currency = XTR
 ```
 
-Cuando Telegram confirma que el usuario pasó a ser miembro mediante el enlace de campaña, se registra un ingreso confirmado.
+El pago se valida mediante `pre_checkout_query` y `successful_payment`.
 
-Reporte de ejemplo:
+El sistema conserva `telegram_payment_charge_id` para poder solicitar un reembolso completo cuando corresponda.
+
+Comando de soporte:
 
 ```text
-📊 Resultados · Campaña #214
-
-Canal: Noticias México
-Categoría: 10K
-
-🛂 Solicitudes de ingreso
-Solicitudes únicas atribuidas: 326
-Ingresos confirmados: 241
-Sin ingreso confirmado: 85
-Conversión solicitud → ingreso: 73.9%
-
-👥 Crecimiento neto del canal
-Al iniciar: 12,450
-Al finalizar: 12,681
-Diferencia neta: +231
+/paysupport
 ```
 
-`Sin ingreso confirmado` **no significa necesariamente rechazado**. Puede incluir solicitudes pendientes, canceladas o no convertidas durante la ventana de la campaña. El bot no inventa un estado de rechazo si Telegram no se lo informó.
+---
 
-### Ingreso directo
+# 5. Revisión administrativa
 
-Si el canal usa:
+Después de un pago, la campaña queda en:
 
 ```text
-🚪 Ingreso directo
+paid_review
 ```
 
-el bot también crea un enlace exclusivo, pero con:
-
-```python
-creates_join_request=False
-```
-
-Los ingresos que Telegram atribuya a ese enlace se guardan como ingresos de la campaña.
-
-Ejemplo:
+El administrador puede:
 
 ```text
-🚪 Ingresos atribuidos al enlace: 187
-Miembros inicio: 8,532
-Miembros fin: 8,703
-Crecimiento neto: +171
+✅ Aprobar y reclutar
+❌ Rechazar + reembolsar
 ```
 
-Los valores no tienen por qué ser iguales. Durante la campaña pueden existir bajas y entradas por otras fuentes.
+Al aprobar se abre la ventana de reclutamiento. Al rechazar, el bot intenta reembolsar el pago en Stars.
 
-### Por qué se mantienen dos métricas
+Si al iniciar no hay ninguna fuente válida, no se pueden crear enlaces, o el canal anunciado ya no tiene permisos adecuados, la campaña se cancela y se intenta reembolsar automáticamente.
 
-**Atribución de campaña**:
+---
 
-- solicitudes generadas por el enlace exclusivo;
-- ingresos confirmados atribuibles al enlace.
+# 6. Atribución de conversiones
 
-**Crecimiento neto**:
-
-- total de miembros al iniciar;
-- total de miembros al finalizar;
-- diferencia.
-
-Esto evita afirmar que todo el crecimiento neto fue generado por la botonera.
-
-### Ciclo de vida del enlace
-
-Al publicar:
+Cada canal participante obtiene un enlace exclusivo hacia el canal anunciado:
 
 ```text
-Crear campaña
-→ generar enlace exclusivo por canal
-→ publicar la botonera
-→ contar solicitudes/ingresos
-→ terminar duración
-→ eliminar publicaciones
-→ revocar enlaces
-→ cerrar campaña
-→ enviar estadísticas
+Campaña #31
+├─ Canal fuente A → enlace A
+├─ Canal fuente B → enlace B
+└─ Canal fuente C → enlace C
 ```
 
-Además de revocarlos al cierre, los enlaces se crean con fecha de expiración como segunda protección.
+Por ello el sistema sabe qué fuente originó la conversión.
 
-### Cambios durante una campaña
+## Primera atribución
 
-- El `shuffle` reconstruye el teclado usando los mismos enlaces exclusivos de la campaña.
-- Un refresco de botones no crea una campaña nueva.
-- Los botones manuales del administrador no reciben enlaces de atribución.
-- Si un canal aprobado entra mientras una campaña sigue activa, se genera su enlace exclusivo con la misma expiración de la campaña.
-- Si cambia de Ingreso directo a Solicitud de ingreso (o viceversa) y vuelve a aprobarse durante una campaña, se reemplaza el enlace de esa campaña por uno del modo correcto.
-
-### Historial del participante
-
-El apartado `📊 Estadísticas` muestra ahora también:
+La clave lógica es:
 
 ```text
-🛂 Solicitudes atribuidas
-✅ Ingresos atribuidos
-📈 Crecimiento neto
+campaign_id + telegram_user_id
 ```
 
-Por canal, las campañas nuevas muestran:
+Un usuario solo puede producir una conversión dentro de una campaña.
+
+Si primero llega desde Canal A y posteriormente pulsa Canal B:
 
 ```text
-13/08/2026 · 9,850 → 10,021 · +171
-   🛂 248 solicitudes · ✅ 190 ingresos
+Fuente pagable = Canal A
 ```
 
-El historial creado antes de v6.2 sigue apareciendo, simplemente sin las métricas de atribución que no existían en esas versiones.
+## Solicitudes repetidas
 
-### Permisos necesarios
-
-Para que la medición funcione correctamente el bot debe continuar siendo administrador y conservar **Invitar usuarios**. Telegram exige ese permiso para recibir solicitudes de ingreso y para crear/revocar enlaces de invitación.
-
-La aplicación además solicita `chat_member` explícitamente mediante `Update.ALL_TYPES` para poder registrar cambios de membresía.
-
-### Actualización desde v6.1
-
-1. Haz respaldo de:
+Se guardan dos métricas:
 
 ```text
-.env
-botoneras.sqlite3
+Solicitudes únicas
+Intentos de solicitud
 ```
 
-2. Reemplaza el código por v6.2.
-3. Conserva tu mismo `.env`.
-4. Instala/actualiza dependencias:
+Una misma persona puede generar varios intentos pero únicamente una solicitud/conversión única.
 
-```bash
-pip install -r requirements.txt
+---
+
+# 7. Antifraude y retención
+
+No se almacena IP. La atribución utiliza el identificador único del usuario de Telegram y los eventos de membresía.
+
+Reglas incluidas:
+
+- un usuario = máximo una conversión por campaña;
+- primera fuente gana la atribución;
+- bots no generan pago;
+- administradores/propietarios del canal objetivo no generan pago;
+- reentradas no generan conversiones nuevas;
+- abandonar antes de validar invalida la conversión;
+- reingresar después de un abandono temprano no reinicia la posibilidad de cobro;
+- retención mínima configurable (24h por defecto);
+- el saldo queda `pending` hasta superar la validación;
+- solo después pasa a `available`.
+
+---
+
+# 8. Botones patrocinados
+
+Los patrocinados se muestran encima del bloque normal:
+
+```text
+[ ⭐ Canal patrocinado ]
+[ Canal normal A ]
+[ Canal normal B ]
+[ Botón manual admin ]
 ```
 
-5. Arranca normalmente:
+Reglas:
 
-```bash
-python main.py
+- una sola columna;
+- patrocinados no participan en el shuffle;
+- cada copia usa el enlace correspondiente a su canal fuente;
+- los botones normales de canales sí pueden mezclarse;
+- los manuales del admin mantienen su orden.
+
+Cuando se alcanza la meta de ingresos atribuidos:
+
+1. la adquisición se cierra;
+2. se revocan los enlaces;
+3. desaparece el botón patrocinado de todos los posts activos de las fuentes;
+4. se conserva la validación de retención pendiente;
+5. posteriormente se acreditan las conversiones válidas.
+
+Si un canal fuente se retira, elimina el bot o pierde elegibilidad, su enlace patrocinado se revoca de inmediato. Las conversiones válidas registradas antes de ese momento pueden seguir su proceso de validación.
+
+---
+
+# 9. Economía v7
+
+Ejemplo con valores predeterminados:
+
+```text
+Precio anunciante: 300 Stars / 1,000 objetivo
+Comisión plataforma: 20%
+Pool participantes: 80%
+Retención: 24h
 ```
 
-No elimines `botoneras.sqlite3`. Al iniciar, el sistema crea automáticamente las tablas de campañas y agrega `campaign_id` a las publicaciones existentes.
+Para 1,000:
 
-No se requieren variables nuevas de `.env` para esta versión.
+```text
+300 Stars cobradas
+→ 20% plataforma
+→ 240 unidades Star-equivalentes de contabilidad interna para participantes
+→ 0.240 por conversión verificada
+```
+
+La distribución es proporcional: quien genera más conversiones verificadas acumula más saldo.
+
+### Importante sobre el monedero
+
+El saldo de participantes se expresa internamente en milésimas para poder repartir cantidades pequeñas. **No representa una transferencia automática de Telegram Stars al usuario.** Es un libro contable interno preparado para una futura liquidación externa.
+
+Esta versión permite:
+
+```text
+saldo pendiente
+saldo disponible
+histórico
+solicitud de retiro
+revisión admin del retiro
+```
+
+La liquidación real del retiro es manual en v7.
+
+---
+
+# 10. Variables de monetización
+
+```env
+MONETIZATION_ENABLED=true
+MONETIZATION_STARS_PER_1000=300
+MONETIZATION_PLATFORM_FEE_BPS=2000
+MONETIZATION_RETENTION_HOURS=24
+MONETIZATION_OPPORTUNITY_HOURS=3
+MONETIZATION_MAX_CAMPAIGN_HOURS=72
+MONETIZATION_MIN_WITHDRAW_STARS=10
+MONETIZATION_GOALS=1000,2000,5000
+```
+
+`MONETIZATION_PLATFORM_FEE_BPS` usa basis points:
+
+```text
+1000 = 10%
+1500 = 15%
+2000 = 20%
+2500 = 25%
+```
+
+---
+
+# 11. Comandos principales
+
+Participante:
+
+```text
+/start
+/miscanales
+/verificarcanal
+/monetizacion
+/publicidad
+/paysupport
+```
+
+Administrador:
+
+```text
+/panel
+/pendientes
+/publicar 5K
+/eliminarpublicacion 5K
+/programar 5K 18:00
+/duracion 5K 6
+/mezcla 5K 10
+/nomezcla 5K
+/plantilla 5K
+/preview 5K
+/health
+/backup
+/auditarpermisos
+/transferircanal CHAT_ID USER_ID
+```
+
+---
+
+# 12. Base de datos nueva
+
+La v7 añade principalmente:
+
+```text
+monetization_profiles
+sponsored_campaigns
+sponsored_sources
+sponsored_users
+wallet_ledger
+withdrawal_requests
+```
+
+Las migraciones son automáticas y no requieren borrar tablas anteriores.
+
+---
+
+# 13. Recomendación antes de producción
+
+Antes de aceptar campañas reales:
+
+1. configura tu tarifa real de Stars;
+2. prueba una campaña completa con cuentas/canales de prueba;
+3. confirma reembolsos de Stars;
+4. prueba ingreso directo y solicitud de ingreso;
+5. prueba abandono antes/después de retención;
+6. define tu proceso manual de liquidación de retiros;
+7. conserva backups automáticos activos.
+
+La monetización puede desactivarse completamente con:
+
+```env
+MONETIZATION_ENABLED=false
+```
+
+sin afectar las botoneras normales.

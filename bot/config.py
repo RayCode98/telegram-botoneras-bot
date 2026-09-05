@@ -36,6 +36,15 @@ class Settings:
     backup_minute: int
     backup_retention_days: int
     permission_check_seconds: int
+    # v7: monetización con Telegram Stars
+    monetization_enabled: bool
+    monetization_stars_per_1000: int
+    monetization_platform_fee_bps: int
+    monetization_retention_hours: int
+    monetization_opportunity_hours: int
+    monetization_max_campaign_hours: int
+    monetization_min_withdraw_milli: int
+    monetization_goals: tuple[int, ...]
 
     @property
     def timezone(self) -> ZoneInfo:
@@ -97,6 +106,16 @@ def load_settings() -> Settings:
         backup_minute=backup_minute,
         backup_retention_days=max(1, int(os.getenv("BACKUP_RETENTION_DAYS", "14"))),
         permission_check_seconds=max(300, int(os.getenv("PERMISSION_CHECK_SECONDS", "900"))),
+        monetization_enabled=_bool_env("MONETIZATION_ENABLED", True),
+        monetization_stars_per_1000=max(1, int(os.getenv("MONETIZATION_STARS_PER_1000", "300"))),
+        monetization_platform_fee_bps=min(9000, max(0, int(os.getenv("MONETIZATION_PLATFORM_FEE_BPS", "2000")))),
+        monetization_retention_hours=max(1, int(os.getenv("MONETIZATION_RETENTION_HOURS", "24"))),
+        monetization_opportunity_hours=max(1, int(os.getenv("MONETIZATION_OPPORTUNITY_HOURS", "3"))),
+        monetization_max_campaign_hours=max(6, int(os.getenv("MONETIZATION_MAX_CAMPAIGN_HOURS", "72"))),
+        monetization_min_withdraw_milli=max(1000, int(float(os.getenv("MONETIZATION_MIN_WITHDRAW_STARS", "10")) * 1000)),
+        monetization_goals=tuple(sorted({
+            max(100, int(x.strip())) for x in os.getenv("MONETIZATION_GOALS", "1000,2000,5000").split(",") if x.strip()
+        })),
     )
 
 

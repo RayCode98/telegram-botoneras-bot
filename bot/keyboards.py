@@ -169,6 +169,7 @@ def admin_home_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📨 Apelaciones", callback_data="panel:appeals"),
         ],
         [InlineKeyboardButton("🩺 Sistema", callback_data="panel:system", style="primary")],
+        [InlineKeyboardButton("💰 Monetización", callback_data="monadm:home", style="success")],
         [InlineKeyboardButton("👤 Mi panel", callback_data="user:home"), InlineKeyboardButton("🔄 Actualizar", callback_data="panel:home")],
     ])
 
@@ -272,6 +273,7 @@ def participant_home_keyboard(is_admin_user: bool = False) -> InlineKeyboardMark
         [InlineKeyboardButton("📡 Mis canales", callback_data="user:channels", style="primary"), InlineKeyboardButton("📊 Estadísticas", callback_data="user:stats")],
         [InlineKeyboardButton("➕ Agregar canal", callback_data="user:add"), InlineKeyboardButton("🕐 Próximas botoneras", callback_data="user:next")],
         [InlineKeyboardButton("⚠️ Mi estado", callback_data="user:status"), InlineKeyboardButton("🔔 Notificaciones", callback_data="user:notifications")],
+        [InlineKeyboardButton("💰 Monetización", callback_data="money:home", style="success"), InlineKeyboardButton("📢 Publicidad", callback_data="ads:home", style="primary")],
         [InlineKeyboardButton("ℹ️ Ayuda", callback_data="user:help")],
     ]
     if is_admin_user:

@@ -135,6 +135,21 @@ class Publisher:
                 )
         return buttons
 
+    def _sponsored_buttons(self, destination_chat_id: int | None) -> list:
+        """Botones patrocinados activos para ESTA copia de la botonera.
+
+        Cada canal fuente recibe un enlace distinto, por eso no pueden construirse
+        globalmente por categoría. Se mantienen fuera del shuffle normal.
+        """
+        if destination_chat_id is None:
+            return []
+        buttons = []
+        for row in self.db.active_sponsored_buttons_for_source(int(destination_chat_id)):
+            if row.get("invite_link"):
+                title = row.get("title") or "Canal patrocinado"
+                buttons.append(url_button(f"⭐ {title}", row["invite_link"], "success"))
+        return buttons
+
     def _manual_buttons(self, category: str) -> list:
         # Los botones manuales mantienen siempre el orden definido por el admin.
         return [
@@ -147,6 +162,7 @@ class Publisher:
         category: str,
         *,
         campaign_id: int | None = None,
+        destination_chat_id: int | None = None,
         shuffle_channels: bool = False,
         shuffle_seed: int | None = None,
     ) -> InlineKeyboardMarkup:
@@ -160,19 +176,24 @@ class Publisher:
         # Los botones de admin se agregan DESPUÉS del bloque de canales y nunca
         # participan en random.shuffle(). Además se les reserva espacio dentro del
         # límite para que una mezcla no haga desaparecer botones manuales.
+        sponsored_buttons = self._sponsored_buttons(destination_chat_id)
         manual_buttons = self._manual_buttons(category)
         if self.settings.max_buttons_per_board > 0:
             limit = self.settings.max_buttons_per_board
-            manual_buttons = manual_buttons[:limit]
-            channel_limit = max(0, limit - len(manual_buttons))
+            sponsored_buttons = sponsored_buttons[:limit]
+            remaining = max(0, limit - len(sponsored_buttons))
+            manual_buttons = manual_buttons[:remaining]
+            channel_limit = max(0, remaining - len(manual_buttons))
             channel_buttons = channel_buttons[:channel_limit]
-        buttons = channel_buttons + manual_buttons
+        # Patrocinados arriba para dar visibilidad; no participan en el shuffle.
+        buttons = sponsored_buttons + channel_buttons + manual_buttons
         return rows_one(buttons) if buttons else InlineKeyboardMarkup([])
 
     def markup_for_row(self, row: dict) -> InlineKeyboardMarkup:
         return self.build_markup(
             row["category"],
             campaign_id=row.get("campaign_id"),
+            destination_chat_id=row.get("destination_chat_id"),
             shuffle_seed=row.get("shuffle_seed"),
         )
 
@@ -195,7 +216,7 @@ class Publisher:
                 await bot.edit_message_reply_markup(
                     chat_id=row["destination_chat_id"],
                     message_id=row["message_id"],
-                    reply_markup=self.build_markup(category, campaign_id=row.get("campaign_id"), shuffle_seed=seed),
+                    reply_markup=self.build_markup(category, campaign_id=row.get("campaign_id"), destination_chat_id=row.get("destination_chat_id"), shuffle_seed=seed),
                 )
                 self.db.set_board_shuffle_seed(row["id"], seed)
                 self.db.mark_board_checked(row["id"])
@@ -767,7 +788,7 @@ class Publisher:
                     chat_id=chat_id,
                     photo=template["photo_file_id"],
                     caption=template.get("text") or None,
-                    reply_markup=self.build_markup(category, campaign_id=campaign_id, shuffle_seed=seed),
+                    reply_markup=self.build_markup(category, campaign_id=campaign_id, destination_chat_id=chat_id, shuffle_seed=seed),
                     parse_mode="HTML",
                 )
                 self.db.add_board_message(
@@ -918,7 +939,7 @@ class Publisher:
                 chat_id=chat_id,
                 photo=template["photo_file_id"],
                 caption=template.get("text") or None,
-                reply_markup=self.build_markup(category, campaign_id=campaign_id, shuffle_seed=seed),
+                reply_markup=self.build_markup(category, campaign_id=campaign_id, destination_chat_id=chat_id, shuffle_seed=seed),
                 parse_mode="HTML",
             )
             self.db.add_board_message(
