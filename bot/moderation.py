@@ -125,7 +125,12 @@ class ModerationService:
 
         owner_id = channel.get("owner_user_id")
         owner_category = channel.get("category")
-        self.db.set_channel_fields(channel["chat_id"], status="suspended")
+        self.db.set_channel_fields(
+            channel["chat_id"], status="suspended",
+            suspension_reason="Una botonera fue eliminada antes de finalizar su tiempo de publicación.",
+            suspension_source="moderation", suspended_at=datetime.now(self.settings.timezone).isoformat(),
+            suspended_by_admin_id=None,
+        )
 
         # Retiramos las demás botoneras del canal que cometió la falta para dejar de
         # distribuirle contenido hasta revisión.

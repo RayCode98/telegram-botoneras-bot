@@ -464,3 +464,10 @@ MONETIZATION_ENABLED=false
 ```
 
 sin afectar las botoneras normales.
+
+
+## v7.1 — Canales suspendidos
+
+El panel administrativo incluye **⏸ Suspendidos**. Desde ahí se pueden revisar suspensiones manuales, por moderación y por permisos, recalcular miembros y quitar la suspensión. La reactivación comprueba primero que el bot conserve sus permisos, que el propietario no esté bloqueado y que el canal cumpla el mínimo de miembros.
+
+Desde **📡 Canales** también se puede suspender manualmente un canal aprobado. La suspensión administrativa no genera una falta, elimina las publicaciones activas de ese canal, retira su botón de las botoneras y lo deshabilita como fuente de campañas pagadas.

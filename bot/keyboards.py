@@ -165,10 +165,13 @@ def admin_home_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🔘 Botones", callback_data="panel:buttons"),
         ],
         [
-            InlineKeyboardButton("🚫 Sanciones", callback_data="panel:sanctions", style="danger"),
-            InlineKeyboardButton("📨 Apelaciones", callback_data="panel:appeals"),
+            InlineKeyboardButton("⏸ Suspendidos", callback_data="panel:suspended", style="danger"),
+            InlineKeyboardButton("🚫 Sanciones", callback_data="panel:sanctions"),
         ],
-        [InlineKeyboardButton("🩺 Sistema", callback_data="panel:system", style="primary")],
+        [
+            InlineKeyboardButton("📨 Apelaciones", callback_data="panel:appeals"),
+            InlineKeyboardButton("🩺 Sistema", callback_data="panel:system", style="primary"),
+        ],
         [InlineKeyboardButton("💰 Monetización", callback_data="monadm:home", style="success")],
         [InlineKeyboardButton("👤 Mi panel", callback_data="user:home"), InlineKeyboardButton("🔄 Actualizar", callback_data="panel:home")],
     ])
@@ -252,9 +255,47 @@ def publish_delete_confirm_keyboard(category: str) -> InlineKeyboardMarkup:
 
 def channel_admin_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚫 Suspender", callback_data=f"channel_admin:suspend:{chat_id}", style="danger")],
+        [InlineKeyboardButton("⏸ Suspender canal", callback_data=f"channel_admin:suspendask:{chat_id}", style="danger")],
         [InlineKeyboardButton("🔄 Recalcular", callback_data=f"channel_admin:recalc:{chat_id}")],
         [InlineKeyboardButton("⬅️ Canales", callback_data="panel:channels")],
+    ])
+
+
+def channel_suspend_confirm_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚫 Sí, suspender", callback_data=f"channel_admin:suspendconfirm:{chat_id}", style="danger")],
+        [InlineKeyboardButton("↩️ Cancelar", callback_data=f"channel_admin:view:{chat_id}")],
+    ])
+
+
+def suspended_channels_keyboard(channels: list[dict], page: int = 0, per_page: int = 8) -> InlineKeyboardMarkup:
+    total = len(channels)
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(0, min(page, pages - 1))
+    start = page * per_page
+    rows = []
+    for ch in channels[start:start + per_page]:
+        icon = "🔴" if ch.get("status") == "suspended" else "⚠️"
+        title = (ch.get("telegram_title") or str(ch["chat_id"]))[:45]
+        rows.append([InlineKeyboardButton(f"{icon} {title}", callback_data=f"suspended:view:{ch['chat_id']}:{page}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"suspended:list:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="suspended:noop:0"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"suspended:list:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("➕ Suspender otro canal", callback_data="panel:channels", style="danger")])
+    rows.append([InlineKeyboardButton("⬅️ Panel", callback_data="panel:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def suspended_channel_actions_keyboard(chat_id: int, page: int = 0) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Quitar suspensión", callback_data=f"suspended:unsuspend:{chat_id}:{page}", style="success")],
+        [InlineKeyboardButton("🔄 Recalcular miembros", callback_data=f"suspended:recalc:{chat_id}:{page}")],
+        [InlineKeyboardButton("⬅️ Suspendidos", callback_data=f"suspended:list:{page}")],
     ])
 
 

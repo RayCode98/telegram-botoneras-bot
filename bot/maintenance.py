@@ -138,7 +138,10 @@ class MaintenanceService:
 
             if ok:
                 if old_status == "permission_suspended":
-                    self.db.set_channel_fields(channel["chat_id"], status="approved")
+                    self.db.set_channel_fields(
+                        channel["chat_id"], status="approved", suspension_reason=None,
+                        suspension_source=None, suspended_at=None, suspended_by_admin_id=None,
+                    )
                     restored += 1
                     if channel.get("category") in CATEGORIES:
                         changed_categories.add(channel["category"])
@@ -155,7 +158,12 @@ class MaintenanceService:
                 # preventiva, nunca como falta. my_chat_member seguirá atendiendo una
                 # expulsión explícita y su sistema de sanciones por separado.
                 if old_status == "approved":
-                    self.db.set_channel_fields(channel["chat_id"], status="permission_suspended")
+                    self.db.set_channel_fields(
+                        channel["chat_id"], status="permission_suspended",
+                        suspension_reason="Permisos incompletos: " + (issue_text or "el bot no es administrador"),
+                        suspension_source="permissions", suspended_at=datetime.now(self.settings.timezone).isoformat(),
+                        suspended_by_admin_id=None,
+                    )
                     suspended += 1
                     if channel.get("category") in CATEGORIES:
                         changed_categories.add(channel["category"])
@@ -199,7 +207,12 @@ class MaintenanceService:
         ok, issues = await self.inspect_channel_permissions(bot, channel)
         self.db.set_channel_permission_state(channel["chat_id"], ok, "; ".join(issues) if issues else None)
         if not ok and channel.get("status") == "approved":
-            self.db.set_channel_fields(channel["chat_id"], status="permission_suspended")
+            self.db.set_channel_fields(
+                channel["chat_id"], status="permission_suspended",
+                suspension_reason="Permisos incompletos: " + (", ".join(issues) or "el bot no es administrador"),
+                suspension_source="permissions", suspended_at=datetime.now(self.settings.timezone).isoformat(),
+                suspended_by_admin_id=None,
+            )
             await self.safe_dm(
                 bot,
                 channel.get("owner_user_id"),
@@ -209,7 +222,10 @@ class MaintenanceService:
                 parse_mode="HTML",
             )
         elif ok and channel.get("status") == "permission_suspended":
-            self.db.set_channel_fields(channel["chat_id"], status="approved")
+            self.db.set_channel_fields(
+                channel["chat_id"], status="approved", suspension_reason=None, suspension_source=None,
+                suspended_at=None, suspended_by_admin_id=None,
+            )
         return ok, issues
 
     # ------------------------------------------------------------------

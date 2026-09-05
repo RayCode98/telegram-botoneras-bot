@@ -31,6 +31,9 @@ from .keyboards import (
     approval_keyboard,
     category_keyboard,
     channel_admin_keyboard,
+    channel_suspend_confirm_keyboard,
+    suspended_channels_keyboard,
+    suspended_channel_actions_keyboard,
     color_keyboard,
     lifetime_actions_keyboard,
     link_type_keyboard,
@@ -112,22 +115,32 @@ def required_channel_permissions(member) -> list[str]:
 def fmt_channel(ch: dict) -> str:
     owner = ch.get("owner_user_id")
     sanction = db.get_sanction(owner) if owner else {"strikes": 0, "banned": 0}
-    return (
-        f"<b>{html.escape(ch.get('telegram_title') or 'Sin título')}</b>\n"
-        f"ID: <code>{ch['chat_id']}</code>\n"
-        f"Botón: <b>{html.escape(ch.get('button_title') or '—')}</b>\n"
-        f"Miembros: <b>{int(ch.get('member_count') or 0):,}</b>\n"
-        f"Categoría: <b>{html.escape(ch.get('category') or '—')}</b>\n"
-        + (f"Próxima categoría: <b>{html.escape(ch.get('pending_category'))}</b> 🔄\n" if ch.get("pending_category") else "")
-        + f"Ingreso: <b>{html.escape(invite_mode_label(ch.get('invite_type')))}</b>\n"
-        f"Color: <b>{html.escape(ch.get('button_style') or 'default')}</b>\n"
-        f"Estado: <b>{html.escape(ch.get('status') or '—')}</b>\n"
-        f"Permisos: <b>{'✅ OK' if ch.get('permissions_ok', 1) else '⚠️ incompletos'}</b>\n"
-        + (f"Detalle permisos: <b>{html.escape(ch.get('permission_issues') or '')}</b>\n" if not ch.get('permissions_ok', 1) else "")
-        + f"Responsable: <code>{owner or '—'}</code>\n"
+    lines = [
+        f"<b>{html.escape(ch.get('telegram_title') or 'Sin título')}</b>",
+        f"ID: <code>{ch['chat_id']}</code>",
+        f"Botón: <b>{html.escape(ch.get('button_title') or '—')}</b>",
+        f"Miembros: <b>{int(ch.get('member_count') or 0):,}</b>",
+        f"Categoría: <b>{html.escape(ch.get('category') or '—')}</b>",
+    ]
+    if ch.get("pending_category"):
+        lines.append(f"Próxima categoría: <b>{html.escape(ch.get('pending_category'))}</b> 🔄")
+    lines.extend([
+        f"Ingreso: <b>{html.escape(invite_mode_label(ch.get('invite_type')))}</b>",
+        f"Color: <b>{html.escape(ch.get('button_style') or 'default')}</b>",
+        f"Estado: <b>{html.escape(ch.get('status') or '—')}</b>",
+    ])
+    if ch.get("status") in {"suspended", "permission_suspended"}:
+        lines.append(f"Suspensión: <b>{html.escape(ch.get('suspension_reason') or 'Sin motivo registrado')}</b>")
+        lines.append(f"Origen: <b>{html.escape(ch.get('suspension_source') or '—')}</b>")
+    lines.append(f"Permisos: <b>{'✅ OK' if ch.get('permissions_ok', 1) else '⚠️ incompletos'}</b>")
+    if not ch.get("permissions_ok", 1):
+        lines.append(f"Detalle permisos: <b>{html.escape(ch.get('permission_issues') or '')}</b>")
+    lines.append(f"Responsable: <code>{owner or '—'}</code>")
+    lines.append(
         f"Faltas: <b>{int(sanction.get('strikes') or 0)}/{settings.violation_limit}</b>"
         + (" 🚫" if sanction.get("banned") else "")
     )
+    return "\n".join(lines)
 
 
 async def safe_dm(bot, user_id: int | None, text: str, **kwargs) -> bool:
@@ -541,7 +554,13 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             missing = required_channel_permissions(new)
             db.set_channel_permission_state(chat.id, not missing, "; ".join(missing) if missing else None)
             if missing and existing.get("status") == "approved":
-                db.set_channel_fields(chat.id, status="permission_suspended")
+                db.set_channel_fields(
+                    chat.id, status="permission_suspended",
+                    suspension_reason="Permisos de administrador incompletos: " + ", ".join(missing),
+                    suspension_source="permissions",
+                    suspended_at=datetime.now(settings.timezone).isoformat(),
+                    suspended_by_admin_id=None,
+                )
                 await monetization.disable_source_channel(context.bot, chat.id, "permissions_lost")
                 if existing.get("category") in CATEGORIES:
                     await publisher.refresh_category(context.bot, existing["category"])
@@ -553,7 +572,10 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML",
                 )
             elif not missing and existing.get("status") == "permission_suspended":
-                db.set_channel_fields(chat.id, status="approved")
+                db.set_channel_fields(
+                    chat.id, status="approved", suspension_reason=None, suspension_source=None,
+                    suspended_at=None, suspended_by_admin_id=None,
+                )
                 if existing.get("category") in CATEGORIES:
                     await publisher.refresh_category(context.bot, existing["category"])
                 await safe_dm(
@@ -1179,7 +1201,10 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        db.set_channel_fields(chat_id, status="approved", rejection_reason=None)
+        db.set_channel_fields(
+            chat_id, status="approved", rejection_reason=None,
+            suspension_reason=None, suspension_source=None, suspended_at=None, suspended_by_admin_id=None,
+        )
         await publisher.refresh_category(context.bot, category)
         await publisher.publish_to_newly_approved_if_live(context.bot, category, chat_id)
         await publisher.refresh_category(context.bot, category)
@@ -1202,6 +1227,7 @@ def panel_summary() -> str:
         f"Bloqueados: <b>{len(db.banned_users())}</b>",
         f"Apelaciones: <b>{len(db.pending_appeals())}</b>",
         f"Posts activos: <b>{len(db.active_board_messages())}</b>",
+        f"Suspendidos manual/moderación: <b>{len(db.channels_by_status('suspended'))}</b>",
         f"Suspendidos por permisos: <b>{len(db.channels_by_status('permission_suspended'))}</b>",
         f"Distribución: <b>{html.escape(settings.distribute_mode)}</b>",
         "",
@@ -1264,6 +1290,8 @@ async def panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_html(fmt_channel(ch), reply_markup=approval_keyboard(ch["chat_id"]))
     elif action == "buttons":
         await q.edit_message_text("🔘 <b>Administrar botones</b>\nSelecciona una categoría:", parse_mode="HTML", reply_markup=category_keyboard("buttons"))
+    elif action == "suspended":
+        await show_suspended_channels_panel(q, 0)
     elif action == "sanctions":
         await show_sanctions_panel(q)
     elif action == "appeals":
@@ -1644,6 +1672,135 @@ async def shuffle_panel_callback(update: Update, context: ContextTypes.DEFAULT_T
         )
 
 
+async def show_suspended_channels_panel(q, page: int = 0):
+    rows = db.suspended_channels()
+    manual = sum(1 for ch in rows if ch.get("status") == "suspended")
+    permissions = sum(1 for ch in rows if ch.get("status") == "permission_suspended")
+    await q.edit_message_text(
+        "⏸ <b>Canales suspendidos</b>\n\n"
+        f"Total: <b>{len(rows)}</b>\n"
+        f"🔴 Manual / moderación: <b>{manual}</b>\n"
+        f"⚠️ Por permisos: <b>{permissions}</b>\n\n"
+        "Selecciona un canal para revisar el motivo y administrar su suspensión.",
+        parse_mode="HTML",
+        reply_markup=suspended_channels_keyboard(rows, page),
+    )
+
+
+async def suspended_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_admin(q.from_user.id):
+        await q.answer("Solo administradores.", show_alert=True)
+        return
+
+    parts = q.data.split(":")
+    action = parts[1]
+    if action == "noop":
+        return
+    if action == "list":
+        await show_suspended_channels_panel(q, int(parts[2]))
+        return
+
+    chat_id = int(parts[2])
+    page = int(parts[3]) if len(parts) > 3 else 0
+    ch = db.get_channel(chat_id)
+    if not ch:
+        await q.answer("Canal no encontrado.", show_alert=True)
+        return
+
+    if action == "view":
+        await q.edit_message_text(
+            "⏸ <b>Detalle de suspensión</b>\n\n" + fmt_channel(ch),
+            parse_mode="HTML",
+            reply_markup=suspended_channel_actions_keyboard(chat_id, page),
+        )
+        return
+
+    if action == "recalc":
+        try:
+            count = await context.bot.get_chat_member_count(chat_id)
+            category = category_from_members(count, settings.min_members)
+            db.set_channel_fields(chat_id, member_count=count, category=category)
+            ch = db.get_channel(chat_id)
+            await q.edit_message_text(
+                "🔄 <b>Datos actualizados.</b>\n\n" + fmt_channel(ch),
+                parse_mode="HTML",
+                reply_markup=suspended_channel_actions_keyboard(chat_id, page),
+            )
+        except TelegramError as exc:
+            await q.answer(f"No se pudo consultar el canal: {exc}", show_alert=True)
+        return
+
+    if action == "unsuspend":
+        if ch.get("status") not in {"suspended", "permission_suspended"}:
+            await q.answer("Este canal ya no está suspendido.", show_alert=True)
+            await show_suspended_channels_panel(q, page)
+            return
+        owner_id = ch.get("owner_user_id")
+        if owner_id and db.is_banned(owner_id) and not is_admin(owner_id):
+            await q.answer("El propietario está bloqueado. Primero retira su sanción.", show_alert=True)
+            return
+
+        ok, issues = await maintenance.inspect_channel_permissions(context.bot, ch)
+        db.set_channel_permission_state(chat_id, ok, "; ".join(issues) if issues else None)
+        if not ok:
+            # Si la causa ya es de permisos, mantenemos el estado preventivo. Si era
+            # suspensión manual, no la levantamos hasta que el canal sea operable.
+            if ch.get("status") == "permission_suspended":
+                db.set_channel_fields(
+                    chat_id,
+                    suspension_reason="Permisos incompletos: " + (", ".join(issues) or "el bot no es administrador"),
+                    suspension_source="permissions",
+                )
+            await q.edit_message_text(
+                "⚠️ <b>No se puede quitar la suspensión todavía.</b>\n\n"
+                f"Telegram reporta: <b>{html.escape(', '.join(issues) or 'permisos incompletos')}</b>.\n\n"
+                "Restaura los permisos del bot y vuelve a intentarlo.",
+                parse_mode="HTML",
+                reply_markup=suspended_channel_actions_keyboard(chat_id, page),
+            )
+            return
+
+        try:
+            count = await context.bot.get_chat_member_count(chat_id)
+        except TelegramError:
+            count = int(ch.get("member_count") or 0)
+        category = category_from_members(count, settings.min_members)
+        old_category = ch.get("category")
+        new_status = "approved" if category in CATEGORIES else "below_minimum"
+        db.set_channel_fields(
+            chat_id,
+            status=new_status,
+            member_count=count,
+            category=category,
+            suspension_reason=None,
+            suspension_source=None,
+            suspended_at=None,
+            suspended_by_admin_id=None,
+        )
+        if old_category in CATEGORIES:
+            await publisher.refresh_category(context.bot, old_category)
+        if category in CATEGORIES:
+            await publisher.refresh_category(context.bot, category)
+        await safe_dm(
+            context.bot, owner_id,
+            ("✅ <b>Suspensión retirada.</b>\n\n"
+             f"Tu canal <b>{html.escape(ch.get('telegram_title') or str(chat_id))}</b> vuelve a estar habilitado para las botoneras."
+             if new_status == "approved" else
+             "📉 <b>Suspensión retirada.</b>\n\nEl canal ya no está suspendido, pero permanece fuera de las botoneras porque está por debajo del mínimo de miembros requerido."),
+            parse_mode="HTML",
+        )
+        db.log_system_event("channel_unsuspended", f"chat_id={chat_id}; admin={q.from_user.id}; status={new_status}")
+        await q.edit_message_text(
+            ("✅ <b>Suspensión retirada.</b>" if new_status == "approved" else "📉 <b>Suspensión retirada; canal bajo mínimo.</b>")
+            + "\n\n" + fmt_channel(db.get_channel(chat_id)),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Suspendidos", callback_data=f"suspended:list:{page}")]]),
+        )
+        return
+
+
 async def channel_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1655,13 +1812,59 @@ async def channel_admin_callback(update: Update, context: ContextTypes.DEFAULT_T
     if not ch:
         return
 
-    if action == "suspend":
-        db.set_channel_fields(chat_id, status="suspended")
+    if action == "view":
+        await q.edit_message_text(
+            "📡 <b>Administrar canal</b>\n\n" + fmt_channel(ch),
+            parse_mode="HTML",
+            reply_markup=channel_admin_keyboard(chat_id) if ch.get("status") == "approved" else InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Panel", callback_data="panel:channels")]]),
+        )
+        return
+
+    if action == "suspendask":
+        if ch.get("status") != "approved":
+            await q.answer("Solo se puede suspender desde aquí un canal aprobado.", show_alert=True)
+            return
+        await q.edit_message_text(
+            "⚠️ <b>Confirmar suspensión</b>\n\n"
+            + fmt_channel(ch)
+            + "\n\nSe retirará de las botoneras activas y de nuevas conversiones patrocinadas. Esta suspensión administrativa no genera una falta.",
+            parse_mode="HTML",
+            reply_markup=channel_suspend_confirm_keyboard(chat_id),
+        )
+        return
+
+    if action == "suspendconfirm":
+        if ch.get("status") != "approved":
+            await q.answer("El canal ya no está aprobado.", show_alert=True)
+            return
+        db.set_channel_fields(
+            chat_id,
+            status="suspended",
+            suspension_reason="Suspendido manualmente por un administrador.",
+            suspension_source="admin",
+            suspended_at=datetime.now(settings.timezone).isoformat(),
+            suspended_by_admin_id=q.from_user.id,
+        )
+        await monetization.disable_source_channel(context.bot, chat_id, "admin_suspended")
         await publisher.delete_active_posts_for_chat(context.bot, chat_id, "admin_suspended")
         if ch.get("category") in CATEGORIES:
             await publisher.refresh_category(context.bot, ch["category"])
-        await q.edit_message_text("🚫 <b>Canal suspendido.</b>\n\n" + fmt_channel(db.get_channel(chat_id)), parse_mode="HTML")
-    elif action == "recalc":
+        await safe_dm(
+            context.bot, ch.get("owner_user_id"),
+            "⏸ <b>Canal suspendido por administración.</b>\n\n"
+            f"Canal: <b>{html.escape(ch.get('telegram_title') or str(chat_id))}</b>\n"
+            "Mientras esté suspendido no participará en nuevas botoneras. Esta acción administrativa no suma una falta.",
+            parse_mode="HTML",
+        )
+        db.log_system_event("channel_admin_suspended", f"chat_id={chat_id}; admin={q.from_user.id}", "warning")
+        await q.edit_message_text(
+            "⏸ <b>Canal suspendido correctamente.</b>\n\n" + fmt_channel(db.get_channel(chat_id)),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Ver suspendidos", callback_data="panel:suspended")], [InlineKeyboardButton("⬅️ Panel", callback_data="panel:home")]]),
+        )
+        return
+
+    if action == "recalc":
         try:
             count = await context.bot.get_chat_member_count(chat_id)
             category = category_from_members(count, settings.min_members)
@@ -1671,7 +1874,12 @@ async def channel_admin_callback(update: Update, context: ContextTypes.DEFAULT_T
                 await publisher.refresh_category(context.bot, old)
             if category in CATEGORIES:
                 await publisher.refresh_category(context.bot, category)
-            await q.edit_message_text("🔄 <b>Canal actualizado.</b>\n\n" + fmt_channel(db.get_channel(chat_id)), parse_mode="HTML", reply_markup=channel_admin_keyboard(chat_id))
+            updated = db.get_channel(chat_id)
+            await q.edit_message_text(
+                "🔄 <b>Canal actualizado.</b>\n\n" + fmt_channel(updated),
+                parse_mode="HTML",
+                reply_markup=channel_admin_keyboard(chat_id) if updated.get("status") == "approved" else InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Panel", callback_data="panel:channels")]]),
+            )
         except TelegramError as exc:
             await q.message.reply_text(f"No pude recalcular: {exc}")
 
@@ -2658,6 +2866,7 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(lifetime_panel_callback, pattern=r"^lifetime:"))
     app.add_handler(CallbackQueryHandler(shuffle_panel_callback, pattern=r"^shuffle:"))
     app.add_handler(CallbackQueryHandler(channel_admin_callback, pattern=r"^channel_admin:"))
+    app.add_handler(CallbackQueryHandler(suspended_panel_callback, pattern=r"^suspended:"))
     app.add_handler(CallbackQueryHandler(manual_panel_callback, pattern=r"^manual_panel:"))
     app.add_handler(CallbackQueryHandler(manual_color_callback, pattern=r"^manual_(add|edit)_color:"))
     app.add_handler(CallbackQueryHandler(sanction_callback, pattern=r"^sanction:"))

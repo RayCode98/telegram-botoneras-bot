@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS channels (
     permission_issues TEXT,
     permission_checked_at TEXT,
     owner_bound_at TEXT,
+    suspension_reason TEXT,
+    suspension_source TEXT,
+    suspended_at TEXT,
+    suspended_by_admin_id INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -423,6 +427,10 @@ class Database:
         self._ensure_column("channels", "permission_issues", "TEXT")
         self._ensure_column("channels", "permission_checked_at", "TEXT")
         self._ensure_column("channels", "owner_bound_at", "TEXT")
+        self._ensure_column("channels", "suspension_reason", "TEXT")
+        self._ensure_column("channels", "suspension_source", "TEXT")
+        self._ensure_column("channels", "suspended_at", "TEXT")
+        self._ensure_column("channels", "suspended_by_admin_id", "INTEGER")
         self._ensure_column("board_messages", "campaign_id", "INTEGER")
         self._ensure_column("sponsored_campaigns", "request_attempts_count", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("sponsored_sources", "request_attempts_count", "INTEGER NOT NULL DEFAULT 0")
@@ -770,6 +778,16 @@ class Database:
 
     def channels_by_status(self, status: str) -> list[dict]:
         return self.all("SELECT * FROM channels WHERE status=? ORDER BY updated_at DESC", (status,))
+
+    def suspended_channels(self) -> list[dict]:
+        """Suspensiones administrables: manual/moderación y preventivas por permisos."""
+        return self.all(
+            """
+            SELECT * FROM channels
+            WHERE status IN ('suspended','permission_suspended')
+            ORDER BY CASE status WHEN 'suspended' THEN 0 ELSE 1 END, updated_at DESC
+            """
+        )
 
     def set_channel_fields(self, chat_id: int, **fields):
         if not fields:
