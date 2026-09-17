@@ -45,6 +45,10 @@ class Settings:
     monetization_max_campaign_hours: int
     monetization_min_withdraw_milli: int
     monetization_goals: tuple[int, ...]
+    # v7.2: campañas manuales USD + retiros USDT
+    monetization_usdt_min_withdraw_usd: float
+    monetization_usdt_fee_usd: float
+    monetization_usdt_networks: tuple[str, ...]
 
     @property
     def timezone(self) -> ZoneInfo:
@@ -116,6 +120,11 @@ def load_settings() -> Settings:
         monetization_goals=tuple(sorted({
             max(100, int(x.strip())) for x in os.getenv("MONETIZATION_GOALS", "1000,2000,5000").split(",") if x.strip()
         })),
+        monetization_usdt_min_withdraw_usd=max(1.0, float(os.getenv("MONETIZATION_USDT_MIN_WITHDRAW_USD", "50"))),
+        monetization_usdt_fee_usd=max(0.0, float(os.getenv("MONETIZATION_USDT_FEE_USD", "3"))),
+        monetization_usdt_networks=tuple(
+            x.strip().upper() for x in os.getenv("MONETIZATION_USDT_NETWORKS", "TRC20,BEP20").split(",") if x.strip()
+        ) or ("TRC20",),
     )
 
 

@@ -883,10 +883,49 @@ async def participant_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             f"🔘 Botón: <b>{html.escape(ch.get('button_title') or '—')}</b>\n"
             f"🎨 Color: <b>{html.escape(ch.get('button_style') or 'default')}</b>\n"
             f"🔗 Ingreso: <b>{html.escape(invite_mode_label(ch.get('invite_type')))}</b>\n"
+            f"💰 Monetización del canal: <b>{'🟢 activa' if ch.get('monetization_enabled') else '⚪️ desactivada'}</b>\n"
             f"🕐 Próxima botonera: <b>{html.escape(next_text)}</b>"
         )
-        await q.edit_message_text(text, parse_mode="HTML", reply_markup=participant_channel_keyboard(chat_id, ch.get("status") or ""))
+        await q.edit_message_text(
+            text, parse_mode="HTML",
+            reply_markup=participant_channel_keyboard(chat_id, ch.get("status") or "", bool(ch.get("monetization_enabled")))
+        )
         return
+    if data.startswith("user:monetchan:"):
+        chat_id = int(data.split(":", 2)[2])
+        ch = db.get_channel(chat_id)
+        if not ch or ch.get("owner_user_id") != user_id:
+            await q.answer("Ese canal no te pertenece.", show_alert=True)
+            return
+        profile = db.get_monetization_profile(user_id)
+        if not profile.get("enabled"):
+            await q.answer("Primero activa el programa de monetización desde 💰 Monetización.", show_alert=True)
+            return
+        new_value = 0 if ch.get("monetization_enabled") else 1
+        db.set_channel_fields(chat_id, monetization_enabled=new_value)
+        if not new_value:
+            await monetization.disable_source_channel(context.bot, chat_id, "owner_monetization_disabled")
+        await q.answer("Monetización del canal activada." if new_value else "Monetización del canal desactivada.", show_alert=True)
+        ch = db.get_channel(chat_id) or ch
+        nxt = _next_start_for_category(ch.get("category") or "") if ch.get("status") == "approved" else None
+        next_text = nxt.strftime("%d/%m/%Y %H:%M") if nxt else "No programada / no elegible"
+        text = (
+            f"📡 <b>{html.escape(ch.get('telegram_title') or str(chat_id))}</b>\n\n"
+            f"👥 Suscriptores: <b>{int(ch.get('member_count') or 0):,}</b>\n"
+            f"📊 Categoría: <b>{html.escape(ch.get('category') or '—')}</b>\n"
+            f"Estado: <b>{html.escape(ch.get('status') or '—')}</b>\n"
+            f"🔘 Botón: <b>{html.escape(ch.get('button_title') or '—')}</b>\n"
+            f"🎨 Color: <b>{html.escape(ch.get('button_style') or 'default')}</b>\n"
+            f"🔗 Ingreso: <b>{html.escape(invite_mode_label(ch.get('invite_type')))}</b>\n"
+            f"💰 Monetización del canal: <b>{'🟢 activa' if ch.get('monetization_enabled') else '⚪️ desactivada'}</b>\n"
+            f"🕐 Próxima botonera: <b>{html.escape(next_text)}</b>"
+        )
+        await q.edit_message_text(
+            text, parse_mode="HTML",
+            reply_markup=participant_channel_keyboard(chat_id, ch.get("status") or "", bool(ch.get("monetization_enabled")))
+        )
+        return
+
     if data == "user:stats":
         summary = db.owner_stats_summary(user_id, 30)
         channels = db.channels_for_owner(user_id)
@@ -2091,6 +2130,9 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = session.get("chat_id")
     category = session.get("category")
     payload = session.get("payload", {})
+
+    if await monetization.handle_text_input(update, context, session):
+        return
 
     if action in {"channel_title", "channel_title_edit"}:
         if await deny_if_banned(user.id, msg):

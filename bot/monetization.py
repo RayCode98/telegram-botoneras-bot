@@ -4,6 +4,7 @@ import html
 import logging
 import math
 import secrets
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from datetime import datetime, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
@@ -35,6 +36,36 @@ def milli_xtr_text(value: int | None) -> str:
     if frac:
         return f"{sign}{whole:,}.{frac:03d} ⭐-eq"
     return f"{sign}{whole:,} ⭐-eq"
+
+
+def usd_text(micros: int | None) -> str:
+    value = int(micros or 0)
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    dollars = Decimal(value) / Decimal(1_000_000)
+    return f"{sign}${dollars:,.4f} USD" if value % 10_000 else f"{sign}${dollars:,.2f} USD"
+
+
+def usdt_text(micros: int | None) -> str:
+    value = int(micros or 0)
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    amount = Decimal(value) / Decimal(1_000_000)
+    return f"{sign}{amount:,.4f} USDT" if value % 10_000 else f"{sign}{amount:,.2f} USDT"
+
+
+def campaign_money_text(campaign: dict, field: str = "pool") -> str:
+    if campaign.get("funding_type") == "manual_usd":
+        key = "participant_pool_usd_micros" if field == "pool" else "rate_usd_micros_per_verified"
+        return usd_text(campaign.get(key))
+    key = "participant_pool_milli" if field == "pool" else "rate_milli_per_verified"
+    return milli_xtr_text(campaign.get(key))
+
+
+def campaign_payment_text(campaign: dict) -> str:
+    if campaign.get("funding_type") == "manual_usd":
+        return usd_text(campaign.get("budget_usd_micros"))
+    return f"{int(campaign.get('stars_price') or 0):,} ⭐"
 
 
 def campaign_status_label(status: str | None) -> str:
@@ -107,6 +138,7 @@ class MonetizationService:
         profile = self.db.get_monetization_profile(user_id)
         enabled = bool(profile.get("enabled"))
         rows = [
+            [InlineKeyboardButton("ℹ️ Cómo funciona", callback_data="money:info", style="primary")],
             [InlineKeyboardButton("💵 Mi monedero", callback_data="money:wallet", style="success")],
             [InlineKeyboardButton("📣 Oportunidades", callback_data="money:opportunities")],
             [InlineKeyboardButton("📊 Mis campañas pagadas", callback_data="money:history")],
@@ -130,16 +162,49 @@ class MonetizationService:
 
         if data == "money:home":
             profile = self.db.get_monetization_profile(uid)
-            wallet = self.db.wallet_summary(uid)
+            usd_wallet = self.db.usd_wallet_summary(uid)
+            legacy = self.db.wallet_summary(uid)
+            legacy_line = ""
+            if legacy["available_milli"] or legacy["pending_milli"]:
+                legacy_line = f"Saldo legado Stars-equivalente: <b>{milli_xtr_text(legacy['available_milli'])}</b>\n"
             text = (
-                "💰 <b>Monetización</b>\n\n"
-                f"Estado: <b>{'🟢 activa' if profile.get('enabled') else '⚪️ desactivada'}</b>\n"
-                f"Disponible: <b>{milli_xtr_text(wallet['available_milli'])}</b>\n"
-                f"Pendiente de retención: <b>{milli_xtr_text(wallet['pending_milli'])}</b>\n\n"
-                "Las ganancias son contabilidad interna equivalente a Stars. "
-                "Los retiros se solicitan al administrador y se liquidan manualmente mientras no exista un método de pago externo configurado."
+                f"💰 <b>Monetización</b>\n\n"
+                f"Estado general: <b>{'🟢 activa' if profile.get('enabled') else '⚪️ desactivada'}</b>\n"
+                f"Saldo USD disponible: <b>{usd_text(usd_wallet['available_micros'])}</b>\n"
+                f"USD pendiente de validación: <b>{usd_text(usd_wallet['pending_micros'])}</b>\n"
+                f"{legacy_line}\n"
+                "<b>¿Cómo funciona?</b>\n"
+                "• Tú decides si entrar al programa y qué canales pueden monetizar.\n"
+                "• Antes de una campaña recibes una invitación para participar.\n"
+                f"• Solo los suscriptores atribuidos y válidos después de {self.settings.monetization_retention_hours}h generan ganancia.\n"
+                "• En promociones manuales, quien aporte más conversiones válidas recibe una mayor parte del presupuesto.\n"
+                f"• Puedes solicitar retiro por USDT desde ${self.settings.monetization_usdt_min_withdraw_usd:.2f}; comisión fija ${self.settings.monetization_usdt_fee_usd:.2f}.\n\n"
+                "Puedes activar o desactivar nuevas oportunidades cuando quieras. "
+                "Además, cada canal puede habilitarse o deshabilitarse individualmente desde 📡 Mis canales."
             )
             await q.edit_message_text(text, parse_mode="HTML", reply_markup=self.money_home_keyboard(uid))
+            return
+
+        if data == "money:info":
+            text = (
+                "ℹ️ <b>¿Cómo funciona la monetización?</b>\n\n"
+                "1️⃣ Un administrador crea una promoción con un canal objetivo, una meta de suscriptores y un presupuesto en USD.\n\n"
+                "2️⃣ Si tienes la monetización activada, recibirás la oportunidad y podrás decidir si participar y con qué canales.\n\n"
+                "3️⃣ Cada canal participante usa un enlace de atribución propio. El sistema identifica qué canal generó cada ingreso.\n\n"
+                f"4️⃣ La conversión debe permanecer al menos <b>{self.settings.monetization_retention_hours} horas</b>. "
+                "Bots, administradores, reingresos y actividad inválida no generan saldo.\n\n"
+                "5️⃣ En promociones manuales, el presupuesto funciona como pool máximo: cada conversión verificada recibe una parte "
+                "proporcional según la meta establecida. Quien aporta más suscriptores válidos gana más.\n\n"
+                f"6️⃣ Las ganancias en USD pueden retirarse mediante <b>USDT</b> desde "
+                f"<b>${self.settings.monetization_usdt_min_withdraw_usd:.2f} USD</b>. Cada retiro cobra una comisión fija de "
+                f"<b>${self.settings.monetization_usdt_fee_usd:.2f} USD</b> y requiere aprobación administrativa.\n\n"
+                "La participación es voluntaria y puedes desactivar nuevas oportunidades sin perder el saldo ya ganado."
+            )
+            await q.edit_message_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Monetización", callback_data="money:home")]]),
+            )
             return
 
         if data == "money:toggle":
@@ -174,68 +239,129 @@ class MonetizationService:
             self.db.set_monetization_enabled(uid, True)
             await q.edit_message_text(
                 "✅ <b>Monetización activada.</b>\n\n"
-                "Recibirás oportunidades antes de las campañas y elegirás en cuáles participar y con qué canales.",
+                "Recibirás oportunidades antes de las campañas. Para participar, activa también la monetización de cada canal desde 📡 Mis canales.",
                 parse_mode="HTML", reply_markup=self.money_home_keyboard(uid),
             )
             return
 
         if data == "money:wallet":
-            w = self.db.wallet_summary(uid)
-            can_withdraw = w["available_milli"] >= self.settings.monetization_min_withdraw_milli
+            w = self.db.usd_wallet_summary(uid)
+            legacy = self.db.wallet_summary(uid)
+            min_micros = int(round(self.settings.monetization_usdt_min_withdraw_usd * 1_000_000))
+            can_withdraw = w["available_micros"] >= min_micros
             rows = []
             if can_withdraw:
-                rows.append([InlineKeyboardButton("💸 Solicitar retiro", callback_data="money:withdraw", style="success")])
+                rows.append([InlineKeyboardButton("💸 Retirar por USDT", callback_data="money:withdrawusdt", style="success")])
             rows.append([InlineKeyboardButton("⬅️ Monetización", callback_data="money:home")])
             text = (
-                "💵 <b>Mi monedero</b>\n\n"
-                f"Disponible: <b>{milli_xtr_text(w['available_milli'])}</b>\n"
-                f"Pendiente: <b>{milli_xtr_text(w['pending_milli'])}</b>\n"
-                f"Ganancias históricas: <b>{milli_xtr_text(w['historical_milli'])}</b>\n"
-                f"Retiros liquidados: <b>{milli_xtr_text(w['withdrawn_milli'])}</b>\n\n"
-                f"Retiro mínimo: <b>{milli_xtr_text(self.settings.monetization_min_withdraw_milli)}</b>."
+                f"💵 <b>Mi monedero</b>\n\n"
+                f"USD disponible: <b>{usd_text(w['available_micros'])}</b>\n"
+                f"USD pendiente: <b>{usd_text(w['pending_micros'])}</b>\n"
+                f"Ganancias USD históricas: <b>{usd_text(w['historical_micros'])}</b>\n"
+                f"USD retirado: <b>{usd_text(w['withdrawn_micros'])}</b>\n\n"
+                f"Retiro mínimo USDT: <b>${self.settings.monetization_usdt_min_withdraw_usd:.2f}</b>\n"
+                f"Comisión por retiro: <b>${self.settings.monetization_usdt_fee_usd:.2f}</b>\n"
             )
+            if legacy['available_milli'] or legacy['pending_milli']:
+                text += (
+                    "\n<b>Saldo legado de campañas Stars</b>\n"
+                    f"Disponible: {milli_xtr_text(legacy['available_milli'])}\n"
+                    f"Pendiente: {milli_xtr_text(legacy['pending_milli'])}\n"
+                    "Este saldo se mantiene separado del saldo USD para no aplicar una conversión arbitraria de Stars a USDT.\n"
+                )
             await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
             return
 
-        if data == "money:withdraw":
-            w = self.db.wallet_summary(uid)
-            amount = int(w["available_milli"])
-            if amount < self.settings.monetization_min_withdraw_milli:
-                await q.answer("Aún no alcanzas el retiro mínimo.", show_alert=True)
+        if data == "money:withdrawusdt":
+            w = self.db.usd_wallet_summary(uid)
+            min_micros = int(round(self.settings.monetization_usdt_min_withdraw_usd * 1_000_000))
+            if int(w['available_micros']) < min_micros:
+                await q.answer("Aún no alcanzas el retiro mínimo en USD.", show_alert=True)
                 return
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Solicitar todo", callback_data="money:withdrawconfirm", style="success")],
-                [InlineKeyboardButton("❌ Cancelar", callback_data="money:wallet")],
-            ])
+            self.db.set_session(uid, "usdt_withdraw_amount", payload={})
             await q.edit_message_text(
-                f"💸 <b>Solicitar retiro</b>\n\nMonto disponible: <b>{milli_xtr_text(amount)}</b>\n\n"
-                "El administrador recibirá la solicitud. Esta versión no transfiere Stars automáticamente a usuarios.",
-                parse_mode="HTML", reply_markup=kb,
+                (
+                    f"💸 <b>Retiro por USDT</b>\n\n"
+                    f"Saldo disponible: <b>{usd_text(w['available_micros'])}</b>\n"
+                    f"Mínimo: <b>${self.settings.monetization_usdt_min_withdraw_usd:.2f} USD</b>\n"
+                    f"Comisión fija: <b>${self.settings.monetization_usdt_fee_usd:.2f} USD</b>\n\n"
+                    "Escribe el importe bruto en USD que deseas retirar. Ejemplo: <code>75</code>."
+                ),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="money:wallet")]]),
             )
             return
 
-        if data == "money:withdrawconfirm":
-            w = self.db.wallet_summary(uid)
-            amount = int(w["available_milli"])
-            if amount < self.settings.monetization_min_withdraw_milli:
-                await q.answer("Saldo insuficiente o ya reservado.", show_alert=True)
+        if data.startswith("money:withdrawnet:"):
+            network = data.split(":", 2)[2].upper()
+            if network not in self.settings.monetization_usdt_networks:
+                await q.answer("Red no permitida.", show_alert=True)
                 return
-            wid = self.db.create_withdrawal_request(uid, amount)
+            session = self.db.get_session(uid)
+            if not session or session.get('action') != 'usdt_withdraw_network':
+                await q.answer("La solicitud expiró. Inicia el retiro otra vez.", show_alert=True)
+                return
+            payload = session.get('payload', {})
+            payload['network'] = network
+            self.db.set_session(uid, 'usdt_withdraw_address', payload=payload)
             await q.edit_message_text(
-                f"✅ <b>Retiro #{wid} solicitado.</b>\n\nMonto: <b>{milli_xtr_text(amount)}</b>\n"
-                "El saldo quedó reservado hasta que un administrador lo liquide o rechace.",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Monetización", callback_data="money:home")]]),
+                (
+                    f"💸 <b>Retiro USDT · {html.escape(network)}</b>\n\n"
+                    "Envía ahora la <b>dirección de tu wallet USDT</b> para esa red.\n\n"
+                    "Verifica cuidadosamente la dirección: el administrador utilizará exactamente la información registrada aquí."
+                ),
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Cancelar', callback_data='money:wallet')]]),
+            )
+            return
+
+        if data == "money:withdrawconfirmusd":
+            session = self.db.get_session(uid)
+            if not session or session.get('action') != 'usdt_withdraw_confirm':
+                await q.answer("La solicitud expiró.", show_alert=True)
+                return
+            payload = session.get('payload', {})
+            gross = int(payload.get('gross_micros') or 0)
+            fee = int(round(self.settings.monetization_usdt_fee_usd * 1_000_000))
+            w = self.db.usd_wallet_summary(uid)
+            min_micros = int(round(self.settings.monetization_usdt_min_withdraw_usd * 1_000_000))
+            if gross < min_micros or gross > int(w['available_micros']) or gross <= fee:
+                self.db.clear_session(uid)
+                await q.answer("El saldo cambió o el importe ya no es válido.", show_alert=True)
+                return
+            wid = self.db.create_usdt_withdrawal(uid, gross, fee, payload['network'], payload['wallet_address'])
+            self.db.clear_session(uid)
+            withdrawal = self.db.get_usdt_withdrawal(wid)
+            await q.edit_message_text(
+                (
+                    f"✅ <b>Retiro USDT #{wid} solicitado</b>\n\n"
+                    f"Importe bruto: <b>{usd_text(gross)}</b>\n"
+                    f"Comisión: <b>{usd_text(fee)}</b>\n"
+                    f"USDT a enviar: <b>{usdt_text(withdrawal['net_amount_micros'])}</b>\n"
+                    f"Red: <b>{html.escape(payload['network'])}</b>\n"
+                    f"Wallet: <code>{html.escape(payload['wallet_address'])}</code>\n\n"
+                    "La solicitud quedó pendiente de aprobación administrativa."
+                ),
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Monetización', callback_data='money:home')]]),
             )
             for admin_id in self.settings.admin_ids:
                 await self.safe_dm(
-                    context.bot, admin_id,
-                    f"💸 <b>Nueva solicitud de retiro #{wid}</b>\n\nUsuario: <code>{uid}</code>\nMonto: <b>{milli_xtr_text(amount)}</b>",
-                    parse_mode="HTML",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("✅ Marcar pagado", callback_data=f"monadm:withdrawpaid:{wid}", style="success")],
-                        [InlineKeyboardButton("❌ Rechazar", callback_data=f"monadm:withdrawreject:{wid}", style="danger")],
-                    ]),
+                    context.bot,
+                    admin_id,
+                    (
+                        f"💸 <b>Nueva solicitud USDT #{wid}</b>\n\n"
+                        f"Usuario: <code>{uid}</code>\n"
+                        f"Bruto: <b>{usd_text(gross)}</b>\n"
+                        f"Comisión: <b>{usd_text(fee)}</b>\n"
+                        f"Enviar: <b>{usdt_text(withdrawal['net_amount_micros'])}</b>\n"
+                        f"Red: <b>{html.escape(payload['network'])}</b>\n"
+                        f"Wallet: <code>{html.escape(payload['wallet_address'])}</code>"
+                    ),
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton('✅ Ver solicitud', callback_data=f'monadm:usdtview:{wid}', style='success'),
+                    ]]),
                 )
             return
 
@@ -255,8 +381,13 @@ class MonetizationService:
             for c in campaigns:
                 srcs = self.db.selected_sponsored_sources_for_owner(c["id"], uid)
                 verified = sum(int(x.get("verified_count") or 0) for x in srcs)
-                earned = sum(int(x.get("earned_milli") or 0) for x in srcs)
-                lines.append(f"• #{c['id']} · {html.escape(c['title'])} · ✅ {verified} · <b>{milli_xtr_text(earned)}</b>")
+                if c.get("funding_type") == "manual_usd":
+                    earned = sum(int(x.get("earned_usd_micros") or 0) for x in srcs)
+                    money = usd_text(earned)
+                else:
+                    earned = sum(int(x.get("earned_milli") or 0) for x in srcs)
+                    money = milli_xtr_text(earned)
+                lines.append(f"• #{c['id']} · {html.escape(c['title'])} · ✅ {verified} · <b>{money}</b>")
             await q.edit_message_text(
                 "\n".join(lines), parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Monetización", callback_data="money:home")]]),
@@ -283,6 +414,135 @@ class MonetizationService:
 
         if data == "money:noop":
             return
+
+    async def handle_text_input(self, update, context, session: dict) -> bool:
+        """Procesa pasos de monetización que requieren texto libre."""
+        user = update.effective_user
+        msg = update.effective_message
+        if not user or not msg or not msg.text or not session:
+            return False
+        action = session.get("action")
+        payload = session.get("payload", {})
+
+        if action == "usdt_withdraw_amount":
+            try:
+                amount = Decimal(msg.text.strip().replace(",", "."))
+                if amount <= 0:
+                    raise InvalidOperation
+            except (InvalidOperation, ValueError):
+                await msg.reply_text("Importe inválido. Escribe solo el monto en USD, por ejemplo: 75")
+                return True
+            gross = int((amount * Decimal(1_000_000)).to_integral_value(rounding=ROUND_DOWN))
+            minimum = int(round(self.settings.monetization_usdt_min_withdraw_usd * 1_000_000))
+            wallet = self.db.usd_wallet_summary(user.id)
+            if gross < minimum:
+                await msg.reply_html(f"El retiro mínimo es <b>${self.settings.monetization_usdt_min_withdraw_usd:.2f} USD</b>.")
+                return True
+            if gross > int(wallet['available_micros']):
+                await msg.reply_html(f"Saldo insuficiente. Disponible: <b>{usd_text(wallet['available_micros'])}</b>.")
+                return True
+            fee = int(round(self.settings.monetization_usdt_fee_usd * 1_000_000))
+            if gross <= fee:
+                await msg.reply_text("El importe debe ser superior a la comisión de retiro.")
+                return True
+            payload['gross_micros'] = gross
+            self.db.set_session(user.id, 'usdt_withdraw_network', payload=payload)
+            rows = [[InlineKeyboardButton(net, callback_data=f"money:withdrawnet:{net}")] for net in self.settings.monetization_usdt_networks]
+            rows.append([InlineKeyboardButton("❌ Cancelar", callback_data="money:wallet")])
+            await msg.reply_html(
+                (
+                    f"Importe bruto: <b>{usd_text(gross)}</b>\n"
+                    f"Comisión: <b>{usd_text(fee)}</b>\n"
+                    f"Recibirás aproximadamente: <b>{usdt_text(gross-fee)}</b> en USDT.\n\n"
+                    "Selecciona la red:"
+                ),
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+            return True
+
+        if action == "usdt_withdraw_address":
+            address = msg.text.strip()
+            network = str(payload.get('network') or '').upper()
+            basic_valid = 20 <= len(address) <= 150 and not any(ch.isspace() for ch in address)
+            if network == 'TRC20':
+                basic_valid = basic_valid and len(address) == 34 and address.startswith('T')
+            elif network in {'BEP20', 'ERC20'}:
+                basic_valid = basic_valid and len(address) == 42 and address.startswith('0x')
+            if not basic_valid:
+                await msg.reply_text(
+                    f"La dirección no parece válida para {network or 'la red seleccionada'}. "
+                    "Revísala cuidadosamente y vuelve a enviarla."
+                )
+                return True
+            payload['wallet_address'] = address
+            self.db.set_session(user.id, 'usdt_withdraw_confirm', payload=payload)
+            gross = int(payload['gross_micros'])
+            fee = int(round(self.settings.monetization_usdt_fee_usd * 1_000_000))
+            await msg.reply_html(
+                (
+                    "💸 <b>Confirma tu retiro USDT</b>\n\n"
+                    f"Bruto: <b>{usd_text(gross)}</b>\n"
+                    f"Comisión: <b>{usd_text(fee)}</b>\n"
+                    f"USDT a enviar: <b>{usdt_text(gross-fee)}</b>\n"
+                    f"Red: <b>{html.escape(payload['network'])}</b>\n"
+                    f"Wallet: <code>{html.escape(address)}</code>\n\n"
+                    "Revisa la red y la dirección antes de confirmar."
+                ),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Confirmar solicitud", callback_data="money:withdrawconfirmusd", style="success")],
+                    [InlineKeyboardButton("❌ Cancelar", callback_data="money:wallet")],
+                ]),
+            )
+            return True
+
+        if action == "admin_manual_goal" and self.is_admin(user.id):
+            try:
+                goal = int(msg.text.strip().replace(",", ""))
+                if not 1 <= goal <= 5_000_000:
+                    raise ValueError
+            except ValueError:
+                await msg.reply_text("Meta inválida. Escribe una cantidad entera de suscriptores, por ejemplo: 1000")
+                return True
+            payload['goal_members'] = goal
+            self.db.set_session(user.id, 'admin_manual_budget', payload=payload)
+            await msg.reply_html(
+                f"🎯 Meta: <b>{goal:,}</b> suscriptores.\n\n"
+                "Ahora escribe el <b>presupuesto total en USD</b> para repartir entre las conversiones verificadas. "
+                "Ejemplo: <code>15</code>."
+            )
+            return True
+
+        if action == "admin_manual_budget" and self.is_admin(user.id):
+            try:
+                budget = Decimal(msg.text.strip().replace(",", "."))
+                if budget <= 0 or budget > Decimal("1000000"):
+                    raise InvalidOperation
+            except (InvalidOperation, ValueError):
+                await msg.reply_text("Presupuesto inválido. Ejemplo válido: 15 o 25.50")
+                return True
+            budget_micros = int((budget * Decimal(1_000_000)).to_integral_value(rounding=ROUND_DOWN))
+            payload['budget_usd_micros'] = budget_micros
+            self.db.set_session(user.id, 'admin_manual_confirm', payload=payload)
+            goal = int(payload['goal_members'])
+            rate = max(1, budget_micros // goal)
+            await msg.reply_html(
+                (
+                    "📢 <b>Confirmar promoción manual</b>\n\n"
+                    f"Canal: <b>{html.escape(payload['title'])}</b>\n"
+                    f"Meta: <b>{goal:,}</b> suscriptores\n"
+                    f"Presupuesto máximo: <b>{usd_text(budget_micros)}</b>\n"
+                    f"Pago estimado por conversión verificada: <b>{usd_text(rate)}</b>\n"
+                    f"Inicio: dentro de <b>{self.settings.monetization_opportunity_hours} horas</b>\n\n"
+                    "El presupuesto se reparte proporcionalmente según las conversiones verificadas que aporte cada canal participante."
+                ),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Crear y reclutar", callback_data="monadm:manualconfirm", style="success")],
+                    [InlineKeyboardButton("❌ Cancelar", callback_data="monadm:manualcancel")],
+                ]),
+            )
+            return True
+
+        return False
 
     # ------------------------------------------------------------------
     # Advertiser UI + Stars payments
@@ -418,7 +678,7 @@ class MonetizationService:
                 f"🔁 Intentos de solicitud: <b>{int(c.get('request_attempts_count') or 0):,}</b>\n"
                 f"✅ Ingresos atribuidos: <b>{int(c.get('joined_count') or 0):,}</b>\n"
                 f"🛡 Verificados {self.settings.monetization_retention_hours}h: <b>{verified:,}</b> ({pct:.1f}%)\n"
-                f"Pago: <b>{int(c.get('stars_price') or 0):,} ⭐</b>"
+                f"Pago/Presupuesto: <b>{campaign_payment_text(c)}</b>"
             )
             await q.edit_message_text(
                 text, parse_mode="HTML",
@@ -521,8 +781,8 @@ class MonetizationService:
                 f"💰 <b>Nueva oportunidad · Campaña #{cid}</b>\n\n"
                 f"Canal promocionado: <b>{html.escape(campaign.get('title') or str(campaign['target_chat_id']))}</b>\n"
                 f"Objetivo: <b>{int(campaign.get('goal_members') or 0):,} miembros</b>\n"
-                f"Pool participantes: <b>{milli_xtr_text(campaign.get('participant_pool_milli'))}</b>\n"
-                f"Valor por conversión verificada: <b>{milli_xtr_text(campaign.get('rate_milli_per_verified'))}</b>\n"
+                f"Pool participantes: <b>{campaign_money_text(campaign, 'pool')}</b>\n"
+                f"Valor por conversión verificada: <b>{campaign_money_text(campaign, 'rate')}</b>\n"
                 f"Retención requerida: <b>{self.settings.monetization_retention_hours}h</b>\n"
                 f"Comienza: <b>{html.escape(scheduled[:16].replace('T',' '))}</b>\n\n"
                 "Selecciona los canales con los que deseas participar. Cuantas más conversiones válidas genere tu canal, mayor será tu saldo."
@@ -588,8 +848,9 @@ class MonetizationService:
     # ------------------------------------------------------------------
     def admin_home_keyboard(self) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Promoción manual USD", callback_data="monadm:manualnew", style="success")],
             [InlineKeyboardButton("🟡 Campañas por revisar", callback_data="monadm:campaigns", style="primary")],
-            [InlineKeyboardButton("💸 Retiros pendientes", callback_data="monadm:withdrawals")],
+            [InlineKeyboardButton("💸 Retiros USDT", callback_data="monadm:usdtwithdrawals")],
             [InlineKeyboardButton("📊 Resumen", callback_data="monadm:summary")],
             [InlineKeyboardButton("⬅️ Panel", callback_data="panel:home")],
         ])
@@ -607,15 +868,164 @@ class MonetizationService:
         if action == "home":
             review = self.db.sponsored_campaigns_by_status(("paid_review",), 100)
             active = self.db.sponsored_campaigns_by_status(("recruiting", "active", "settling"), 100)
-            withdrawals = self.db.pending_withdrawals(100)
+            usdt_withdrawals = self.db.usdt_withdrawals_by_status(("pending", "approved"), 100)
             await q.edit_message_text(
                 "💰 <b>Administración de monetización</b>\n\n"
-                f"Campañas por revisar: <b>{len(review)}</b>\n"
-                f"En proceso: <b>{len(active)}</b>\n"
-                f"Retiros pendientes: <b>{len(withdrawals)}</b>\n"
-                f"Tarifa: <b>{self.settings.monetization_stars_per_1000} ⭐ / 1K</b>\n"
-                f"Comisión plataforma: <b>{self.settings.monetization_platform_fee_bps/100:.1f}%</b>",
+                f"Campañas Stars por revisar: <b>{len(review)}</b>\n"
+                f"Campañas en proceso: <b>{len(active)}</b>\n"
+                f"Retiros USDT pendientes/aprobados: <b>{len(usdt_withdrawals)}</b>\n"
+                f"Tarifa Stars: <b>{self.settings.monetization_stars_per_1000} ⭐ / 1K</b>\n"
+                f"Comisión Stars plataforma: <b>{self.settings.monetization_platform_fee_bps/100:.1f}%</b>\n"
+                f"Retiro USDT: mínimo <b>${self.settings.monetization_usdt_min_withdraw_usd:.2f}</b> · comisión <b>${self.settings.monetization_usdt_fee_usd:.2f}</b>",
                 parse_mode="HTML", reply_markup=self.admin_home_keyboard(),
+            )
+            return
+
+        if action == "manualnew":
+            self.db.clear_session(q.from_user.id)
+            channels = self.db.all(
+                """SELECT * FROM channels WHERE status='approved' AND permissions_ok=1 ORDER BY telegram_title COLLATE NOCASE LIMIT 50"""
+            )
+            rows = [[InlineKeyboardButton(
+                (ch.get('telegram_title') or str(ch['chat_id']))[:52],
+                callback_data=f"monadm:manualtarget:{ch['chat_id']}",
+            )] for ch in channels]
+            if not rows:
+                rows.append([InlineKeyboardButton("No hay canales elegibles", callback_data="monadm:noop")])
+            rows.append([InlineKeyboardButton("⬅️ Monetización", callback_data="monadm:home")])
+            await q.edit_message_text(
+                "➕ <b>Promoción manual en USD</b>\n\nSelecciona el canal que deseas promocionar. "
+                "El bot debe seguir siendo administrador del canal para generar los enlaces de atribución.",
+                parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows),
+            )
+            return
+
+        if action == "manualtarget":
+            chat_id = int(parts[2])
+            ch = self.db.get_channel(chat_id)
+            if not ch or ch.get('status') != 'approved' or not ch.get('permissions_ok'):
+                await q.answer("Ese canal no está disponible para promoción.", show_alert=True)
+                return
+            self.db.set_session(q.from_user.id, 'admin_manual_goal', payload={
+                'target_chat_id': chat_id,
+                'title': ch.get('telegram_title') or str(chat_id),
+                'entry_mode': 'approval' if ch.get('invite_type') == 'approval' else 'direct',
+            })
+            await q.edit_message_text(
+                f"➕ <b>Promoción manual</b>\n\nCanal: <b>{html.escape(ch.get('telegram_title') or str(chat_id))}</b>\n\n"
+                "Escribe la <b>cantidad de suscriptores objetivo</b>. Ejemplo: <code>1000</code>.",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Cancelar', callback_data='monadm:manualcancel')]]),
+            )
+            return
+
+        if action == "manualconfirm":
+            session = self.db.get_session(q.from_user.id)
+            if not session or session.get('action') != 'admin_manual_confirm':
+                await q.answer("La creación expiró. Inicia nuevamente.", show_alert=True)
+                return
+            payload = session.get('payload', {})
+            now = datetime.now(self.settings.timezone)
+            scheduled = now + timedelta(hours=self.settings.monetization_opportunity_hours)
+            max_end = scheduled + timedelta(hours=self.settings.monetization_max_campaign_hours)
+            campaign_id = self.db.create_manual_sponsored_campaign(
+                q.from_user.id, int(payload['target_chat_id']), payload['title'], int(payload['goal_members']),
+                int(payload['budget_usd_micros']), payload.get('entry_mode') or 'direct',
+                scheduled.isoformat(timespec='seconds'), max_end.isoformat(timespec='seconds'),
+                f"manual-{secrets.token_urlsafe(16)}",
+            )
+            self.db.clear_session(q.from_user.id)
+            campaign = self.db.get_sponsored_campaign(campaign_id)
+            await self.send_opportunities(context.bot, campaign)
+            await q.edit_message_text(
+                f"✅ <b>Promoción manual #{campaign_id} creada</b>\n\n"
+                f"Canal: <b>{html.escape(campaign.get('title') or '')}</b>\n"
+                f"Meta: <b>{int(campaign.get('goal_members') or 0):,}</b>\n"
+                f"Presupuesto: <b>{usd_text(campaign.get('budget_usd_micros'))}</b>\n"
+                f"Inicio programado: <b>{scheduled.strftime('%d/%m/%Y %H:%M')}</b>\n\n"
+                "Las oportunidades ya fueron enviadas a los participantes que tienen monetización habilitada.",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Monetización', callback_data='monadm:home')]]),
+            )
+            return
+
+        if action == "manualcancel":
+            self.db.clear_session(q.from_user.id)
+            await q.edit_message_text("Creación de promoción manual cancelada.", reply_markup=self.admin_home_keyboard())
+            return
+
+        if action == "usdtwithdrawals":
+            withdrawals = self.db.usdt_withdrawals_by_status(("pending", "approved"), 40)
+            rows = []
+            for w in withdrawals:
+                icon = "🟡" if w.get('status') == 'pending' else "🟢"
+                rows.append([InlineKeyboardButton(
+                    f"{icon} #{w['id']} · {usdt_text(w['net_amount_micros'])} · {w['network']}",
+                    callback_data=f"monadm:usdtview:{w['id']}",
+                )])
+            if not rows:
+                rows.append([InlineKeyboardButton("Sin retiros USDT pendientes", callback_data="monadm:noop")])
+            rows.append([InlineKeyboardButton("⬅️ Monetización", callback_data="monadm:home")])
+            await q.edit_message_text(
+                "💸 <b>Retiros USDT</b>\n\n🟡 Pendiente de aprobación · 🟢 Aprobado, pendiente de pago",
+                parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows),
+            )
+            return
+
+        if action == "usdtview":
+            wid = int(parts[2])
+            w = self.db.get_usdt_withdrawal(wid)
+            if not w:
+                return
+            rows = []
+            if w.get('status') == 'pending':
+                rows.append([InlineKeyboardButton('✅ Aprobar retiro', callback_data=f'monadm:usdtapprove:{wid}', style='success')])
+                rows.append([InlineKeyboardButton('❌ Rechazar', callback_data=f'monadm:usdtreject:{wid}', style='danger')])
+            elif w.get('status') == 'approved':
+                rows.append([InlineKeyboardButton('✅ Marcar como pagado', callback_data=f'monadm:usdtpaid:{wid}', style='success')])
+                rows.append([InlineKeyboardButton('❌ Rechazar', callback_data=f'monadm:usdtreject:{wid}', style='danger')])
+            rows.append([InlineKeyboardButton('⬅️ Retiros USDT', callback_data='monadm:usdtwithdrawals')])
+            await q.edit_message_text(
+                f"💸 <b>Retiro USDT #{wid}</b>\n\n"
+                f"Usuario: <code>{w['user_id']}</code>\nEstado: <b>{html.escape(w['status'])}</b>\n"
+                f"Bruto: <b>{usd_text(w['gross_amount_micros'])}</b>\nComisión: <b>{usd_text(w['fee_amount_micros'])}</b>\n"
+                f"Enviar: <b>{usdt_text(w['net_amount_micros'])}</b>\nRed: <b>{html.escape(w['network'])}</b>\n"
+                f"Wallet: <code>{html.escape(w['wallet_address'])}</code>",
+                parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows),
+            )
+            return
+
+        if action in {"usdtapprove", "usdtpaid", "usdtreject"}:
+            wid = int(parts[2])
+            w = self.db.get_usdt_withdrawal(wid)
+            if not w or w.get('status') not in {'pending', 'approved'}:
+                await q.answer("Ese retiro ya fue resuelto.", show_alert=True)
+                return
+            if action == 'usdtapprove':
+                self.db.resolve_usdt_withdrawal(wid, q.from_user.id, 'approved', 'Aprobado por administrador')
+                await self.safe_dm(
+                    context.bot, w['user_id'],
+                    f"✅ <b>Retiro USDT #{wid} aprobado.</b>\n\nImporte a recibir: <b>{usdt_text(w['net_amount_micros'])}</b> por {html.escape(w['network'])}. "
+                    "Queda pendiente de que el administrador realice la transferencia.",
+                    parse_mode='HTML',
+                )
+                await q.edit_message_text(
+                    f"✅ Retiro USDT #{wid} aprobado. Ahora realiza el pago y después márcalo como pagado.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('📋 Volver a retiros', callback_data='monadm:usdtwithdrawals')]]),
+                )
+                return
+            status = 'paid' if action == 'usdtpaid' else 'rejected'
+            self.db.resolve_usdt_withdrawal(wid, q.from_user.id, status, 'Resuelto desde panel de monetización')
+            await self.safe_dm(
+                context.bot, w['user_id'],
+                (f"✅ <b>Retiro USDT #{wid} marcado como pagado.</b>\n\nMonto enviado: <b>{usdt_text(w['net_amount_micros'])}</b>."
+                 if status == 'paid' else
+                 f"❌ <b>Retiro USDT #{wid} rechazado.</b>\n\nEl importe bruto vuelve a quedar disponible en tu monedero USD."),
+                parse_mode='HTML',
+            )
+            await q.edit_message_text(
+                f"Retiro USDT #{wid}: {status}.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Retiros USDT', callback_data='monadm:usdtwithdrawals')]]),
             )
             return
 
@@ -647,7 +1057,8 @@ class MonetizationService:
                 f"Anunciante: <code>{c.get('advertiser_user_id')}</code>\n"
                 f"Estado: <b>{html.escape(campaign_status_label(c.get('status')))}</b>\n"
                 f"Objetivo: <b>{int(c.get('goal_members') or 0):,}</b>\n"
-                f"Pago: <b>{int(c.get('stars_price') or 0):,} ⭐</b>\n"
+                f"Financiamiento: <b>{'Manual USD' if c.get('funding_type') == 'manual_usd' else 'Telegram Stars'}</b>\n"
+                f"Presupuesto/Pago: <b>{campaign_payment_text(c)}</b>\n"
                 f"Solicitudes: <b>{int(c.get('requests_count') or 0):,}</b> ({int(c.get('request_attempts_count') or 0):,} intentos) · "
                 f"Ingresos: <b>{int(c.get('joined_count') or 0):,}</b> · Verificados: <b>{int(c.get('verified_count') or 0):,}</b>",
                 parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows),
@@ -745,16 +1156,23 @@ class MonetizationService:
         if action == "summary":
             with self.db.connection() as conn:
                 row = conn.execute(
-                    """SELECT COUNT(*) n, COALESCE(SUM(stars_price),0) stars,
-                              COALESCE(SUM(verified_count),0) verified FROM sponsored_campaigns WHERE paid_at IS NOT NULL"""
+                    """SELECT COUNT(CASE WHEN funding_type='stars' AND paid_at IS NOT NULL THEN 1 END) star_campaigns,
+                              COALESCE(SUM(CASE WHEN funding_type='stars' AND paid_at IS NOT NULL THEN stars_price ELSE 0 END),0) stars,
+                              COUNT(CASE WHEN funding_type='manual_usd' THEN 1 END) manual_campaigns,
+                              COALESCE(SUM(CASE WHEN funding_type='manual_usd' THEN budget_usd_micros ELSE 0 END),0) manual_budget,
+                              COALESCE(SUM(verified_count),0) verified FROM sponsored_campaigns"""
                 ).fetchone()
                 participants = conn.execute("SELECT COUNT(*) n FROM monetization_profiles WHERE enabled=1").fetchone()[0]
+                channel_optins = conn.execute("SELECT COUNT(*) n FROM channels WHERE monetization_enabled=1").fetchone()[0]
             await q.edit_message_text(
                 "📊 <b>Resumen de monetización</b>\n\n"
-                f"Campañas pagadas: <b>{int(row['n'] or 0)}</b>\n"
+                f"Campañas Stars pagadas: <b>{int(row['star_campaigns'] or 0)}</b>\n"
                 f"Stars cobradas registradas: <b>{int(row['stars'] or 0):,} ⭐</b>\n"
+                f"Promociones manuales USD: <b>{int(row['manual_campaigns'] or 0)}</b>\n"
+                f"Presupuesto manual acumulado: <b>{usd_text(row['manual_budget'])}</b>\n"
                 f"Conversiones verificadas: <b>{int(row['verified'] or 0):,}</b>\n"
-                f"Participantes monetizados: <b>{int(participants or 0)}</b>",
+                f"Participantes monetizados: <b>{int(participants or 0)}</b>\n"
+                f"Canales con monetización habilitada: <b>{int(channel_optins or 0)}</b>",
                 parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Monetización", callback_data="monadm:home")]]),
             )
             return
@@ -808,7 +1226,7 @@ class MonetizationService:
         active_sources = []
         for src in sources:
             channel = self.db.get_channel(src["source_chat_id"])
-            if not channel or channel.get("status") != "approved" or not channel.get("permissions_ok"):
+            if not channel or channel.get("status") != "approved" or not channel.get("permissions_ok") or not channel.get("monetization_enabled"):
                 self.db.upsert_sponsored_source(campaign_id, src["source_chat_id"], src["source_owner_user_id"], False)
                 continue
             name = f"SP{campaign_id}-SRC{abs(int(src['source_chat_id'])) % 1000000}"[:32]
@@ -836,7 +1254,7 @@ class MonetizationService:
                 await self.safe_dm(
                     bot, src["source_owner_user_id"],
                     f"🚀 <b>Campaña #{campaign_id} iniciada.</b>\n\nTu canal ya tiene el botón patrocinado cuando exista una botonera activa. "
-                    f"Cada conversión que permanezca {self.settings.monetization_retention_hours}h puede generar <b>{milli_xtr_text(c.get('rate_milli_per_verified'))}</b>.",
+                    f"Cada conversión que permanezca {self.settings.monetization_retention_hours}h puede generar <b>{campaign_money_text(c, 'rate')}</b>.",
                     parse_mode="HTML",
                 )
         await self.safe_dm(
@@ -932,10 +1350,16 @@ class MonetizationService:
                 campaign = self.db.get_sponsored_campaign(row["campaign_id"])
                 source = self.db.sponsored_source(row["campaign_id"], row["first_source_chat_id"])
                 if campaign and source:
-                    self.db.ensure_pending_earning(
-                        row["campaign_id"], row["first_source_chat_id"], user.id,
-                        source["source_owner_user_id"], int(campaign.get("rate_milli_per_verified") or 0),
-                    )
+                    if campaign.get("funding_type") == "manual_usd":
+                        self.db.ensure_pending_usd_earning(
+                            row["campaign_id"], row["first_source_chat_id"], user.id,
+                            source["source_owner_user_id"], int(campaign.get("rate_usd_micros_per_verified") or 0),
+                        )
+                    else:
+                        self.db.ensure_pending_earning(
+                            row["campaign_id"], row["first_source_chat_id"], user.id,
+                            source["source_owner_user_id"], int(campaign.get("rate_milli_per_verified") or 0),
+                        )
                     campaign = self.db.get_sponsored_campaign(row["campaign_id"])
                     if campaign and campaign.get("status") == "active" and int(campaign.get("joined_count") or 0) >= int(campaign.get("goal_members") or 0):
                         await self.close_acquisition(bot, int(campaign["id"]), "goal_reached")
@@ -965,7 +1389,14 @@ class MonetizationService:
                     or (status == ChatMemberStatus.RESTRICTED and bool(getattr(member, "is_member", False)))
                 )
                 if payable_member:
-                    self.db.mark_sponsored_verified(row["campaign_id"], row["user_id"], int(row.get("rate_milli_per_verified") or 0))
+                    if row.get("funding_type") == "manual_usd":
+                        self.db.mark_sponsored_verified(
+                            row["campaign_id"], row["user_id"], 0, int(row.get("rate_usd_micros_per_verified") or 0)
+                        )
+                    else:
+                        self.db.mark_sponsored_verified(
+                            row["campaign_id"], row["user_id"], int(row.get("rate_milli_per_verified") or 0), 0
+                        )
                     verified += 1
                 elif status in {ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR}:
                     self.db.mark_sponsored_rejected(row["campaign_id"], row["user_id"], "Administradores/propietarios del canal objetivo no generan conversiones pagables")
@@ -987,39 +1418,61 @@ class MonetizationService:
 
     async def send_final_reports(self, bot, campaign: dict):
         cid = int(campaign["id"])
-        participant_pool = int(campaign.get("participant_pool_milli") or 0)
-        earned = 0
-        for src in self.db.sponsored_sources(cid):
-            earned += int(src.get("earned_milli") or 0)
-        unused = max(0, participant_pool - earned)
+        is_usd = campaign.get("funding_type") == "manual_usd"
+        if is_usd:
+            participant_pool = int(campaign.get("participant_pool_usd_micros") or 0)
+            earned = sum(int(src.get("earned_usd_micros") or 0) for src in self.db.sponsored_sources(cid))
+            unused = max(0, participant_pool - earned)
+        else:
+            participant_pool = int(campaign.get("participant_pool_milli") or 0)
+            earned = sum(int(src.get("earned_milli") or 0) for src in self.db.sponsored_sources(cid))
+            unused = max(0, participant_pool - earned)
+
         await self.safe_dm(
-            bot, campaign["advertiser_user_id"],
-            f"✅ <b>Campaña #{cid} finalizada</b>\n\n"
-            f"Objetivo: <b>{int(campaign.get('goal_members') or 0):,}</b>\n"
-            f"Solicitudes únicas: <b>{int(campaign.get('requests_count') or 0):,}</b>\n"
-            f"Intentos de solicitud: <b>{int(campaign.get('request_attempts_count') or 0):,}</b>\n"
-            f"Ingresos atribuidos: <b>{int(campaign.get('joined_count') or 0):,}</b>\n"
-            f"Verificados {self.settings.monetization_retention_hours}h: <b>{int(campaign.get('verified_count') or 0):,}</b>\n"
-            f"No válidos: <b>{int(campaign.get('rejected_count') or 0):,}</b>",
+            bot,
+            campaign["advertiser_user_id"],
+            (
+                f"✅ <b>Campaña #{cid} finalizada</b>\n\n"
+                f"Objetivo: <b>{int(campaign.get('goal_members') or 0):,}</b>\n"
+                f"Solicitudes únicas: <b>{int(campaign.get('requests_count') or 0):,}</b>\n"
+                f"Intentos de solicitud: <b>{int(campaign.get('request_attempts_count') or 0):,}</b>\n"
+                f"Ingresos atribuidos: <b>{int(campaign.get('joined_count') or 0):,}</b>\n"
+                f"Verificados {self.settings.monetization_retention_hours}h: <b>{int(campaign.get('verified_count') or 0):,}</b>\n"
+                f"No válidos: <b>{int(campaign.get('rejected_count') or 0):,}</b>"
+            ),
             parse_mode="HTML",
         )
-        # Resumen por propietario, una notificación por campaña.
+
         owners: dict[int, list[dict]] = {}
         for src in self.db.sponsored_sources(cid):
             owners.setdefault(int(src["source_owner_user_id"]), []).append(src)
         for owner_id, srcs in owners.items():
             verified = sum(int(x.get("verified_count") or 0) for x in srcs)
-            total = sum(int(x.get("earned_milli") or 0) for x in srcs)
+            if is_usd:
+                total = sum(int(x.get("earned_usd_micros") or 0) for x in srcs)
+                amount_text = usd_text(total)
+                tail = "El saldo USD disponible puede retirarse por USDT desde 💰 Monetización → Mi monedero."
+            else:
+                total = sum(int(x.get("earned_milli") or 0) for x in srcs)
+                amount_text = milli_xtr_text(total)
+                tail = "El saldo legado Stars-equivalente se mantiene separado del saldo USD."
             await self.safe_dm(
-                bot, owner_id,
-                f"💰 <b>Resultados pagados · Campaña #{cid}</b>\n\n"
-                f"Canales fuente: <b>{len(srcs)}</b>\n"
-                f"Conversiones verificadas: <b>{verified:,}</b>\n"
-                f"Ganancia acreditada: <b>{milli_xtr_text(total)}</b>\n\n"
-                "El saldo disponible puede solicitarse desde 💰 Monetización → Mi monedero.",
+                bot,
+                owner_id,
+                (
+                    f"💰 <b>Resultados pagados · Campaña #{cid}</b>\n\n"
+                    f"Canales fuente: <b>{len(srcs)}</b>\n"
+                    f"Conversiones verificadas: <b>{verified:,}</b>\n"
+                    f"Ganancia acreditada: <b>{amount_text}</b>\n\n"
+                    f"{tail}"
+                ),
                 parse_mode="HTML",
             )
-        self.db.log_system_event("sponsored_campaign_completed", f"campaign={cid}; earned_milli={earned}; unused_pool_milli={unused}")
+        unit = "usd_micros" if is_usd else "milli_xtr"
+        self.db.log_system_event(
+            "sponsored_campaign_completed",
+            f"campaign={cid}; earned_{unit}={earned}; unused_pool_{unit}={unused}",
+        )
 
     async def job(self, context):
         if not self.enabled():
@@ -1031,7 +1484,7 @@ class MonetizationService:
         for c in self.db.sponsored_campaigns_by_status(("active",), 100):
             for src in self.db.sponsored_sources(int(c["id"]), ("active",)):
                 ch = self.db.get_channel(int(src["source_chat_id"]))
-                if not ch or ch.get("status") != "approved" or not ch.get("permissions_ok"):
+                if not ch or ch.get("status") != "approved" or not ch.get("permissions_ok") or not ch.get("monetization_enabled"):
                     await self.disable_source_channel(context.bot, int(src["source_chat_id"]), "source_not_eligible")
 
         # Comienzos programados.

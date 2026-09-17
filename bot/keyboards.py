@@ -333,11 +333,16 @@ def participant_channels_keyboard(channels: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def participant_channel_keyboard(chat_id: int, status: str) -> InlineKeyboardMarkup:
+def participant_channel_keyboard(chat_id: int, status: str, monetization_enabled: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("✏️ Editar título", callback_data=f"owner:title:{chat_id}"), InlineKeyboardButton("🎨 Cambiar color", callback_data=f"owner:color:{chat_id}")],
         [InlineKeyboardButton("🔗 Cambiar enlace", callback_data=f"owner:link:{chat_id}")],
         [InlineKeyboardButton("📊 Estadísticas", callback_data=f"user:statsch:{chat_id}:0"), InlineKeyboardButton("📈 Progreso", callback_data=f"user:progress:{chat_id}")],
+        [InlineKeyboardButton(
+            "💰 Monetización del canal: ON" if monetization_enabled else "💰 Monetización del canal: OFF",
+            callback_data=f"user:monetchan:{chat_id}",
+            style="success" if monetization_enabled else "primary",
+        )],
     ]
     if status == "approved":
         rows.append([InlineKeyboardButton("🚪 Retirar canal", callback_data=f"user:withdrawask:{chat_id}", style="danger")])

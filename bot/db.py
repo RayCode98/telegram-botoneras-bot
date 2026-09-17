@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS channels (
     suspension_source TEXT,
     suspended_at TEXT,
     suspended_by_admin_id INTEGER,
+    monetization_enabled INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -267,6 +268,10 @@ CREATE TABLE IF NOT EXISTS sponsored_campaigns (
     title TEXT NOT NULL,
     goal_members INTEGER NOT NULL,
     stars_price INTEGER NOT NULL,
+    funding_type TEXT NOT NULL DEFAULT 'stars',
+    budget_usd_micros INTEGER NOT NULL DEFAULT 0,
+    participant_pool_usd_micros INTEGER NOT NULL DEFAULT 0,
+    rate_usd_micros_per_verified INTEGER NOT NULL DEFAULT 0,
     platform_fee_bps INTEGER NOT NULL DEFAULT 2000,
     participant_pool_milli INTEGER NOT NULL DEFAULT 0,
     rate_milli_per_verified INTEGER NOT NULL DEFAULT 0,
@@ -309,6 +314,7 @@ CREATE TABLE IF NOT EXISTS sponsored_sources (
     verified_count INTEGER NOT NULL DEFAULT 0,
     rejected_count INTEGER NOT NULL DEFAULT 0,
     earned_milli INTEGER NOT NULL DEFAULT 0,
+    earned_usd_micros INTEGER NOT NULL DEFAULT 0,
     link_revoked_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -333,6 +339,7 @@ CREATE TABLE IF NOT EXISTS sponsored_users (
     status TEXT NOT NULL DEFAULT 'requested',
     verified_at TEXT,
     earning_milli INTEGER NOT NULL DEFAULT 0,
+    earning_usd_micros INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(campaign_id, user_id),
@@ -369,6 +376,41 @@ CREATE TABLE IF NOT EXISTS withdrawal_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_withdrawal_status ON withdrawal_requests(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_withdrawal_user ON withdrawal_requests(user_id, id DESC);
+
+-- v7.2: saldo USD de campañas manuales y retiros USDT ------------------
+CREATE TABLE IF NOT EXISTS usd_wallet_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    campaign_id INTEGER,
+    source_chat_id INTEGER,
+    conversion_user_id INTEGER,
+    entry_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    amount_micros INTEGER NOT NULL,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(campaign_id, conversion_user_id, entry_type)
+);
+CREATE INDEX IF NOT EXISTS idx_usd_wallet_user ON usd_wallet_ledger(user_id, status, id DESC);
+
+CREATE TABLE IF NOT EXISTS usdt_withdrawal_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    gross_amount_micros INTEGER NOT NULL,
+    fee_amount_micros INTEGER NOT NULL,
+    net_amount_micros INTEGER NOT NULL,
+    network TEXT NOT NULL,
+    wallet_address TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    admin_user_id INTEGER,
+    admin_note TEXT,
+    txid TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_usdt_withdrawal_status ON usdt_withdrawal_requests(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_usdt_withdrawal_user ON usdt_withdrawal_requests(user_id, id DESC);
 
 """
 
@@ -434,6 +476,13 @@ class Database:
         self._ensure_column("board_messages", "campaign_id", "INTEGER")
         self._ensure_column("sponsored_campaigns", "request_attempts_count", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("sponsored_sources", "request_attempts_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("channels", "monetization_enabled", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("sponsored_campaigns", "funding_type", "TEXT NOT NULL DEFAULT 'stars'")
+        self._ensure_column("sponsored_campaigns", "budget_usd_micros", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("sponsored_campaigns", "participant_pool_usd_micros", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("sponsored_campaigns", "rate_usd_micros_per_verified", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("sponsored_sources", "earned_usd_micros", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("sponsored_users", "earning_usd_micros", "INTEGER NOT NULL DEFAULT 0")
         with self.connection() as conn:
             # v6.1: antes la interfaz llamaba "público/privado" al tipo de enlace.
             # Ambos modos antiguos permitían ingreso directo, por lo que se migran
@@ -1414,7 +1463,7 @@ class Database:
 
     def eligible_monetization_channels(self, user_id: int, target_chat_id: int | None = None) -> list[dict]:
         params: list[Any] = [user_id]
-        sql = """SELECT * FROM channels WHERE owner_user_id=? AND status='approved' AND permissions_ok=1"""
+        sql = """SELECT * FROM channels WHERE owner_user_id=? AND status='approved' AND permissions_ok=1 AND monetization_enabled=1"""
         if target_chat_id is not None:
             sql += " AND chat_id<>?"
             params.append(target_chat_id)
@@ -1435,6 +1484,23 @@ class Database:
                ) VALUES (?,?,?,?,?,?,?,?,?,'awaiting_payment',?,?,?)""",
             (advertiser_user_id, target_chat_id, title, goal_members, stars_price,
              platform_fee_bps, pool_milli, rate_milli, entry_mode, invoice_payload, now, now),
+        )
+
+    def create_manual_sponsored_campaign(
+        self, admin_user_id: int, target_chat_id: int, title: str, goal_members: int,
+        budget_usd_micros: int, entry_mode: str, scheduled_at: str, max_end_at: str, invoice_payload: str,
+    ) -> int:
+        budget = max(1, int(budget_usd_micros))
+        rate_usd = max(1, budget // max(1, int(goal_members)))
+        now = now_iso()
+        return self.execute(
+            """INSERT INTO sponsored_campaigns(
+                advertiser_user_id,target_chat_id,title,goal_members,stars_price,funding_type,budget_usd_micros,
+                participant_pool_usd_micros,rate_usd_micros_per_verified,platform_fee_bps,participant_pool_milli,
+                rate_milli_per_verified,entry_mode,status,invoice_payload,admin_user_id,approved_at,scheduled_at,max_end_at,created_at,updated_at
+               ) VALUES (?,?,?,?,0,'manual_usd',?,?,?,0,0,0,?,'recruiting',?,?,?,?,?,?,?)""",
+            (admin_user_id, target_chat_id, title, goal_members, budget, budget, rate_usd, entry_mode, invoice_payload,
+             admin_user_id, now, scheduled_at, max_end_at, now, now),
         )
 
     def get_sponsored_campaign(self, campaign_id: int) -> dict | None:
@@ -1569,7 +1635,7 @@ class Database:
     def sponsored_source_by_link(self, invite_link: str) -> dict | None:
         return self.one(
             """SELECT ss.*, sc.target_chat_id, sc.status AS campaign_status, sc.goal_members,
-                      sc.rate_milli_per_verified, sc.entry_mode
+                      sc.rate_milli_per_verified, sc.rate_usd_micros_per_verified, sc.funding_type, sc.entry_mode
                FROM sponsored_sources ss JOIN sponsored_campaigns sc ON sc.id=ss.campaign_id
                WHERE ss.invite_link=?""",
             (invite_link,),
@@ -1668,6 +1734,10 @@ class Database:
                 "UPDATE wallet_ledger SET status='void', updated_at=? WHERE campaign_id=? AND conversion_user_id=? AND entry_type='earning' AND status='pending'",
                 (now_iso(), row['campaign_id'], user_id),
             )
+            self.execute(
+                "UPDATE usd_wallet_ledger SET status='void', updated_at=? WHERE campaign_id=? AND conversion_user_id=? AND entry_type='earning' AND status='pending'",
+                (now_iso(), row['campaign_id'], user_id),
+            )
         self.refresh_sponsored_counters(row['campaign_id'])
 
     def ensure_pending_earning(self, campaign_id: int, source_chat_id: int, conversion_user_id: int, owner_user_id: int, amount_milli: int):
@@ -1678,10 +1748,18 @@ class Database:
             (owner_user_id, campaign_id, source_chat_id, conversion_user_id, amount_milli, now, now),
         )
 
+    def ensure_pending_usd_earning(self, campaign_id: int, source_chat_id: int, conversion_user_id: int, owner_user_id: int, amount_micros: int):
+        now = now_iso()
+        self.execute(
+            """INSERT OR IGNORE INTO usd_wallet_ledger(user_id,campaign_id,source_chat_id,conversion_user_id,entry_type,status,amount_micros,note,created_at,updated_at)
+               VALUES (?,?,?,?, 'earning','pending',?,'Conversión USD pendiente de retención',?,?)""",
+            (owner_user_id, campaign_id, source_chat_id, conversion_user_id, amount_micros, now, now),
+        )
+
     def pending_sponsored_validations(self, now_value: str, limit: int = 200) -> list[dict]:
         return self.all(
-            """SELECT su.*, sc.rate_milli_per_verified, sc.target_chat_id AS campaign_target_chat_id,
-                      ss.source_owner_user_id
+            """SELECT su.*, sc.rate_milli_per_verified, sc.rate_usd_micros_per_verified, sc.funding_type,
+                      sc.target_chat_id AS campaign_target_chat_id, ss.source_owner_user_id
                FROM sponsored_users su
                JOIN sponsored_campaigns sc ON sc.id=su.campaign_id
                JOIN sponsored_sources ss ON ss.campaign_id=su.campaign_id AND ss.source_chat_id=su.first_source_chat_id
@@ -1690,18 +1768,25 @@ class Database:
             (now_value, limit),
         )
 
-    def mark_sponsored_verified(self, campaign_id: int, user_id: int, earning_milli: int):
+    def mark_sponsored_verified(self, campaign_id: int, user_id: int, earning_milli: int = 0, earning_usd_micros: int = 0):
         now = now_iso()
         self.execute(
-            """UPDATE sponsored_users SET status='verified', verified_at=?, earning_milli=?, updated_at=?
+            """UPDATE sponsored_users SET status='verified', verified_at=?, earning_milli=?, earning_usd_micros=?, updated_at=?
                WHERE campaign_id=? AND user_id=? AND status='joined'""",
-            (now, earning_milli, now, campaign_id, user_id),
+            (now, int(earning_milli), int(earning_usd_micros), now, campaign_id, user_id),
         )
-        self.execute(
-            """UPDATE wallet_ledger SET status='available', amount_milli=?, note='Conversión verificada', updated_at=?
-               WHERE campaign_id=? AND conversion_user_id=? AND entry_type='earning' AND status='pending'""",
-            (earning_milli, now, campaign_id, user_id),
-        )
+        if int(earning_milli) > 0:
+            self.execute(
+                """UPDATE wallet_ledger SET status='available', amount_milli=?, note='Conversión verificada', updated_at=?
+                   WHERE campaign_id=? AND conversion_user_id=? AND entry_type='earning' AND status='pending'""",
+                (int(earning_milli), now, campaign_id, user_id),
+            )
+        if int(earning_usd_micros) > 0:
+            self.execute(
+                """UPDATE usd_wallet_ledger SET status='available', amount_micros=?, note='Conversión USD verificada', updated_at=?
+                   WHERE campaign_id=? AND conversion_user_id=? AND entry_type='earning' AND status='pending'""",
+                (int(earning_usd_micros), now, campaign_id, user_id),
+            )
         self.refresh_sponsored_counters(campaign_id)
 
     def mark_sponsored_rejected(self, campaign_id: int, user_id: int, reason: str):
@@ -1712,6 +1797,11 @@ class Database:
         )
         self.execute(
             """UPDATE wallet_ledger SET status='void', note=?, updated_at=?
+               WHERE campaign_id=? AND conversion_user_id=? AND entry_type='earning' AND status='pending'""",
+            (reason[:300], now, campaign_id, user_id),
+        )
+        self.execute(
+            """UPDATE usd_wallet_ledger SET status='void', note=?, updated_at=?
                WHERE campaign_id=? AND conversion_user_id=? AND entry_type='earning' AND status='pending'""",
             (reason[:300], now, campaign_id, user_id),
         )
@@ -1739,15 +1829,17 @@ class Database:
                           COUNT(CASE WHEN joined_at IS NOT NULL THEN 1 END) joined_count,
                           COUNT(CASE WHEN status='verified' THEN 1 END) verified_count,
                           COUNT(CASE WHEN status='rejected' THEN 1 END) rejected_count,
-                          COALESCE(SUM(CASE WHEN status='verified' THEN earning_milli ELSE 0 END),0) earned_milli
+                          COALESCE(SUM(CASE WHEN status='verified' THEN earning_milli ELSE 0 END),0) earned_milli,
+                          COALESCE(SUM(CASE WHEN status='verified' THEN earning_usd_micros ELSE 0 END),0) earned_usd_micros
                    FROM sponsored_users WHERE campaign_id=? AND first_source_chat_id=?""",
                 (campaign_id, src['source_chat_id']),
             ) or {}
             self.execute(
-                """UPDATE sponsored_sources SET request_count=?, request_attempts_count=?, joined_count=?, verified_count=?, rejected_count=?, earned_milli=?, updated_at=?
+                """UPDATE sponsored_sources SET request_count=?, request_attempts_count=?, joined_count=?, verified_count=?, rejected_count=?, earned_milli=?, earned_usd_micros=?, updated_at=?
                    WHERE campaign_id=? AND source_chat_id=?""",
                 (int(sc.get('request_count') or 0), int(sc.get('request_attempts_count') or 0), int(sc.get('joined_count') or 0),
-                 int(sc.get('verified_count') or 0), int(sc.get('rejected_count') or 0), int(sc.get('earned_milli') or 0), now_iso(), campaign_id, src['source_chat_id']),
+                 int(sc.get('verified_count') or 0), int(sc.get('rejected_count') or 0), int(sc.get('earned_milli') or 0),
+                 int(sc.get('earned_usd_micros') or 0), now_iso(), campaign_id, src['source_chat_id']),
             )
 
     def sponsored_campaign_pending_count(self, campaign_id: int) -> int:
@@ -1802,6 +1894,63 @@ class Database:
         self.execute(
             "UPDATE withdrawal_requests SET status=?, admin_user_id=?, admin_note=?, resolved_at=? WHERE id=?",
             (status, admin_user_id, note, now_iso(), withdrawal_id),
+        )
+
+    def usd_wallet_summary(self, user_id: int) -> dict:
+        row = self.one(
+            """SELECT COALESCE(SUM(CASE WHEN status='available' THEN amount_micros ELSE 0 END),0) available_micros,
+                      COALESCE(SUM(CASE WHEN status='pending' THEN amount_micros ELSE 0 END),0) pending_micros,
+                      COALESCE(SUM(CASE WHEN status IN ('available','paid') AND entry_type='earning' THEN amount_micros ELSE 0 END),0) historical_micros
+               FROM usd_wallet_ledger WHERE user_id=?""",
+            (user_id,),
+        ) or {}
+        withdrawals = self.one(
+            """SELECT COALESCE(SUM(CASE WHEN status IN ('pending','approved','paid') THEN gross_amount_micros ELSE 0 END),0) reserved_micros,
+                      COALESCE(SUM(CASE WHEN status='paid' THEN gross_amount_micros ELSE 0 END),0) paid_micros
+               FROM usdt_withdrawal_requests WHERE user_id=?""",
+            (user_id,),
+        ) or {}
+        available = max(0, int(row.get('available_micros') or 0) - int(withdrawals.get('reserved_micros') or 0))
+        return {
+            'available_micros': available,
+            'pending_micros': int(row.get('pending_micros') or 0),
+            'historical_micros': int(row.get('historical_micros') or 0),
+            'withdrawn_micros': int(withdrawals.get('paid_micros') or 0),
+        }
+
+    def create_usdt_withdrawal(self, user_id: int, gross_amount_micros: int, fee_amount_micros: int, network: str, wallet_address: str) -> int:
+        gross = int(gross_amount_micros)
+        fee = max(0, int(fee_amount_micros))
+        net = max(0, gross - fee)
+        return self.execute(
+            """INSERT INTO usdt_withdrawal_requests(
+                user_id,gross_amount_micros,fee_amount_micros,net_amount_micros,network,wallet_address,status,created_at
+               ) VALUES (?,?,?,?,?,?,'pending',?)""",
+            (user_id, gross, fee, net, network, wallet_address, now_iso()),
+        )
+
+    def usdt_withdrawals_by_status(self, statuses: tuple[str, ...], limit: int = 50) -> list[dict]:
+        if not statuses:
+            return []
+        ph = ",".join("?" for _ in statuses)
+        return self.all(
+            f"""SELECT wr.*, u.username, u.first_name FROM usdt_withdrawal_requests wr
+                LEFT JOIN users u ON u.user_id=wr.user_id WHERE wr.status IN ({ph}) ORDER BY wr.id LIMIT ?""",
+            (*statuses, limit),
+        )
+
+    def pending_usdt_withdrawals(self, limit: int = 50) -> list[dict]:
+        return self.usdt_withdrawals_by_status(('pending',), limit)
+
+    def get_usdt_withdrawal(self, withdrawal_id: int) -> dict | None:
+        return self.one("SELECT * FROM usdt_withdrawal_requests WHERE id=?", (withdrawal_id,))
+
+    def resolve_usdt_withdrawal(self, withdrawal_id: int, admin_user_id: int, status: str, note: str | None = None, txid: str | None = None):
+        if status not in {'approved','paid','rejected'}:
+            raise ValueError('Estado de retiro USDT inválido')
+        self.execute(
+            """UPDATE usdt_withdrawal_requests SET status=?, admin_user_id=?, admin_note=?, txid=?, resolved_at=? WHERE id=?""",
+            (status, admin_user_id, note, txid, now_iso(), withdrawal_id),
         )
 
     # Sessions ----------------------------------------------------------

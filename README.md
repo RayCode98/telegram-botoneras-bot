@@ -471,3 +471,59 @@ sin afectar las botoneras normales.
 El panel administrativo incluye **⏸ Suspendidos**. Desde ahí se pueden revisar suspensiones manuales, por moderación y por permisos, recalcular miembros y quitar la suspensión. La reactivación comprueba primero que el bot conserve sus permisos, que el propietario no esté bloqueado y que el canal cumpla el mínimo de miembros.
 
 Desde **📡 Canales** también se puede suspender manualmente un canal aprobado. La suspensión administrativa no genera una falta, elimina las publicaciones activas de ese canal, retira su botón de las botoneras y lo deshabilita como fuente de campañas pagadas.
+
+---
+
+# v7.2 · Promociones manuales USD y retiros USDT
+
+La v7.2 añade una segunda modalidad de campañas patrocinadas además de las campañas pagadas con Telegram Stars.
+
+## Promoción manual creada por administrador
+
+Desde:
+
+`/panel → 💰 Monetización → ➕ Promoción manual USD`
+
+el administrador selecciona un canal objetivo aprobado y después escribe la meta de suscriptores y el presupuesto máximo en USD.
+
+Ejemplo:
+
+```text
+Canal objetivo: Noticias Premium
+Meta: 1,000
+Presupuesto: $15 USD
+```
+
+La tarifa queda en `$15 / 1,000 = $0.015` por conversión verificada. Un canal fuente que produzca 400 conversiones válidas acumula `$6 USD`; otro que produzca 100 acumula `$1.50 USD`.
+
+El presupuesto de una campaña manual es un pool máximo. Las conversiones que no superen la retención/antifraude no generan saldo.
+
+## Activación por participante y por canal
+
+El dueño debe activar primero el programa desde `💰 Monetización`. Después puede entrar a `📡 Mis canales → canal` y activar `💰 Monetización del canal: ON`.
+
+Solo esos canales serán ofrecidos como fuentes cuando aparezca una nueva oportunidad.
+
+## Retiros USDT
+
+El saldo generado por promociones manuales se almacena en USD. El participante puede solicitar USDT cuando alcanza el mínimo configurado.
+
+Valores por defecto:
+
+```env
+MONETIZATION_USDT_MIN_WITHDRAW_USD=50
+MONETIZATION_USDT_FEE_USD=3
+MONETIZATION_USDT_NETWORKS=TRC20,BEP20
+```
+
+Ejemplo de retiro:
+
+```text
+Solicitud bruta: $75 USD
+Comisión: $3 USD
+USDT a enviar: 72 USDT
+```
+
+El bot no realiza la transferencia cripto automáticamente. La solicitud llega al panel administrativo, donde debe aprobarse. Después de realizar manualmente la transferencia, el administrador marca el retiro como pagado.
+
+El bot conserva por separado cualquier contabilidad antigua relacionada con campañas Stars. No convierte automáticamente Stars a USD/USDT.
