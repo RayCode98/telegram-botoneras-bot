@@ -566,3 +566,36 @@ También puede registrarse directamente desde:
 Para este tipo de canal el bot necesita ser administrador y poder crear enlaces/invitar usuarios. No necesita permisos para publicar, editar o eliminar mensajes porque la botonera no se enviará allí.
 
 Los canales existentes anteriores a v7.3 conservan ambos usos habilitados para no romper su configuración.
+
+# v7.4 · Publicidad pagada por canal y solicitudes manuales
+
+## Control por canal
+
+Dentro de `💰 Monetización -> 📢 Publicidad pagada por canal`, cada propietario puede decidir si las campañas patrocinadas pueden aparecer en la botonera de cada canal:
+
+```text
+🟢 Noticias México · Publicidad ON
+⚪ Historia · Publicidad OFF
+```
+
+El mismo estado también aparece al abrir un canal desde `📡 Mis canales` como `📢 Publicidad pagada en mi botonera`.
+
+## Crear campaña
+
+El anunciante selecciona:
+
+1. canal objetivo;
+2. cantidad de miembros;
+3. método de gestión.
+
+Telegram Stars mantiene el flujo de factura y revisión ya existente.
+
+La opción manual crea una solicitud pendiente y muestra el contacto administrativo. Ninguna campaña manual se publica hasta que un administrador la active. Desde la notificación administrativa, `✅ Activar publicidad` solicita el presupuesto USD acordado y convierte la solicitud en una campaña manual activa/reclutando.
+
+Configura el contacto con:
+
+```env
+MONETIZATION_ADMIN_CONTACT=@TU_USUARIO_ADMIN
+```
+
+> Nota operativa: Telegram exige Telegram Stars para la venta de bienes/servicios digitales dentro de bots. Si habilitas acuerdos manuales externos, revisa el cumplimiento aplicable antes de usarlo en producción.

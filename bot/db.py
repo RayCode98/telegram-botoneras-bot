@@ -1560,6 +1560,47 @@ class Database:
              platform_fee_bps, pool_milli, rate_milli, entry_mode, invoice_payload, now, now),
         )
 
+    def create_manual_contact_campaign_request(
+        self, advertiser_user_id: int, target_chat_id: int, title: str, goal_members: int,
+        entry_mode: str, invoice_payload: str,
+    ) -> int:
+        """Crea una solicitud manual de campaña pendiente de acuerdo con administración.
+
+        No registra un pago ni activa la campaña; el administrador debe revisarla y
+        convertirla posteriormente en una promoción manual USD.
+        """
+        now = now_iso()
+        return self.execute(
+            """INSERT INTO sponsored_campaigns(
+                advertiser_user_id,target_chat_id,title,goal_members,stars_price,funding_type,
+                budget_usd_micros,participant_pool_usd_micros,rate_usd_micros_per_verified,
+                platform_fee_bps,participant_pool_milli,rate_milli_per_verified,entry_mode,status,
+                invoice_payload,created_at,updated_at
+               ) VALUES (?,?,?,?,0,'manual_contact',0,0,0,0,0,0,?,'contact_pending',?,?,?)""",
+            (advertiser_user_id, target_chat_id, title, goal_members, entry_mode, invoice_payload, now, now),
+        )
+
+    def activate_manual_contact_campaign(
+        self, campaign_id: int, admin_user_id: int, budget_usd_micros: int,
+        scheduled_at: str, max_end_at: str,
+    ) -> bool:
+        budget = max(1, int(budget_usd_micros))
+        campaign = self.get_sponsored_campaign(campaign_id)
+        if not campaign or campaign.get('status') != 'contact_pending':
+            return False
+        rate_usd = max(1, budget // max(1, int(campaign.get('goal_members') or 1)))
+        now = now_iso()
+        with self.connection() as conn:
+            cur = conn.execute(
+                """UPDATE sponsored_campaigns
+                   SET funding_type='manual_usd', budget_usd_micros=?, participant_pool_usd_micros=?,
+                       rate_usd_micros_per_verified=?, status='recruiting', admin_user_id=?,
+                       approved_at=?, scheduled_at=?, max_end_at=?, rejection_reason=NULL, updated_at=?
+                   WHERE id=? AND status='contact_pending'""",
+                (budget, budget, rate_usd, admin_user_id, now, scheduled_at, max_end_at, now, campaign_id),
+            )
+            return cur.rowcount > 0
+
     def create_manual_sponsored_campaign(
         self, admin_user_id: int, target_chat_id: int, title: str, goal_members: int,
         budget_usd_micros: int, entry_mode: str, scheduled_at: str, max_end_at: str, invoice_payload: str,

@@ -49,6 +49,8 @@ class Settings:
     monetization_usdt_min_withdraw_usd: float
     monetization_usdt_fee_usd: float
     monetization_usdt_networks: tuple[str, ...]
+    # v7.4: contacto administrativo para solicitudes manuales de publicidad
+    monetization_admin_contact: str
 
     @property
     def timezone(self) -> ZoneInfo:
@@ -125,6 +127,7 @@ def load_settings() -> Settings:
         monetization_usdt_networks=tuple(
             x.strip().upper() for x in os.getenv("MONETIZATION_USDT_NETWORKS", "TRC20,BEP20").split(",") if x.strip()
         ) or ("TRC20",),
+        monetization_admin_contact=os.getenv("MONETIZATION_ADMIN_CONTACT", "").strip(),
     )
 
 

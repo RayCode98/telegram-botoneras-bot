@@ -393,8 +393,8 @@ def participant_channel_keyboard(
             [InlineKeyboardButton("🔗 Cambiar enlace", callback_data=f"owner:link:{chat_id}")],
             [InlineKeyboardButton("📊 Estadísticas", callback_data=f"user:statsch:{chat_id}:0"), InlineKeyboardButton("📈 Progreso", callback_data=f"user:progress:{chat_id}")],
             [InlineKeyboardButton(
-                "💰 Configurar monetización",
-                callback_data="money:channels",
+                f"📢 Publicidad pagada: {'ON' if monetization_enabled else 'OFF'}",
+                callback_data=f"money:chantoggleview:{chat_id}",
                 style="success" if monetization_enabled else "primary",
             )],
         ])

@@ -66,6 +66,8 @@ def campaign_money_text(campaign: dict, field: str = "pool") -> str:
 def campaign_payment_text(campaign: dict) -> str:
     if campaign.get("funding_type") == "manual_usd":
         return usd_text(campaign.get("budget_usd_micros"))
+    if campaign.get("funding_type") == "manual_contact":
+        return "Acuerdo manual pendiente"
     return f"{int(campaign.get('stars_price') or 0):,} ⭐"
 
 
@@ -73,6 +75,7 @@ def campaign_status_label(status: str | None) -> str:
     return {
         "awaiting_payment": "🧾 Esperando pago",
         "paid_review": "🟡 Pago recibido · revisión",
+        "contact_pending": "💬 Pendiente de acuerdo con admin",
         "recruiting": "📣 Reclutando participantes",
         "active": "🟢 Activa",
         "settling": "⏳ Validando retención",
@@ -102,6 +105,26 @@ class MonetizationService:
 
     def participant_share_percent(self) -> float:
         return max(0.0, (10000 - self.settings.monetization_platform_fee_bps) / 100)
+
+    def admin_contact_label(self) -> str:
+        raw = (self.settings.monetization_admin_contact or "").strip()
+        if raw:
+            return raw
+        if self.settings.admin_ids:
+            return f"Telegram ID {sorted(self.settings.admin_ids)[0]}"
+        return "administración"
+
+    def admin_contact_url(self) -> str | None:
+        raw = (self.settings.monetization_admin_contact or "").strip()
+        if raw.startswith("@") and len(raw) > 1:
+            return f"https://t.me/{raw[1:]}"
+        if raw.startswith("https://t.me/") or raw.startswith("http://t.me/"):
+            return raw
+        if raw.startswith("tg://"):
+            return raw
+        if self.settings.admin_ids:
+            return f"tg://user?id={sorted(self.settings.admin_ids)[0]}"
+        return None
 
     def _owner_channels_for_advertising(self, user_id: int) -> list[dict]:
         # Un canal anunciado NO necesita participar en botoneras. Puede estar
@@ -134,7 +157,7 @@ class MonetizationService:
         profile = self.db.get_monetization_profile(user_id)
         active_count = self.db.active_monetization_channel_count(user_id)
         rows = [
-            [InlineKeyboardButton("📡 Configurar mis canales", callback_data="money:channels", style="success" if active_count else "primary")],
+            [InlineKeyboardButton("📢 Publicidad pagada por canal", callback_data="money:channels", style="success" if active_count else "primary")],
             [InlineKeyboardButton("ℹ️ Cómo funciona", callback_data="money:info", style="primary")],
             [InlineKeyboardButton("💵 Mi monedero", callback_data="money:wallet", style="success")],
             [InlineKeyboardButton("📣 Oportunidades", callback_data="money:opportunities")],
@@ -155,7 +178,7 @@ class MonetizationService:
             title = (ch.get("telegram_title") or str(ch["chat_id"]))[:42]
             if eligible:
                 rows.append([InlineKeyboardButton(
-                    f"{icon} {title} · {'ON' if enabled else 'OFF'}",
+                    f"{icon} {title} · Publicidad {'ON' if enabled else 'OFF'}",
                     callback_data=f"money:chantoggle:{ch['chat_id']}",
                     style="success" if enabled else None,
                 )])
@@ -197,7 +220,7 @@ class MonetizationService:
                 f"• Solo los suscriptores atribuidos y válidos después de {self.settings.monetization_retention_hours}h generan ganancia.\n"
                 "• En promociones manuales, quien aporte más conversiones válidas recibe una mayor parte del presupuesto.\n"
                 f"• Puedes solicitar retiro por USDT desde ${self.settings.monetization_usdt_min_withdraw_usd:.2f}; comisión fija ${self.settings.monetization_usdt_fee_usd:.2f}.\n\n"
-                "Configura todo desde <b>📡 Configurar mis canales</b>. Si todos quedan en OFF, tu monetización se considera desactivada automáticamente."
+                "Configura todo desde <b>📢 Publicidad pagada por canal</b>. Si todos quedan en OFF, tu monetización se considera desactivada automáticamente."
             )
             await q.edit_message_text(text, parse_mode="HTML", reply_markup=self.money_home_keyboard(uid))
             return
@@ -272,9 +295,38 @@ class MonetizationService:
                 return
             active_count = self.db.active_monetization_channel_count(uid)
             await q.edit_message_text(
-                "📡 <b>Canales monetizados</b>\n\n"
-                f"Canales activos: <b>{active_count}</b>\n\n"
-                "Activa los canales que quieras usar para generar ganancias. Si al menos uno está en ON, la monetización general queda activa automáticamente.",
+                "📢 <b>Publicidad pagada en mis canales</b>\n\n"
+                f"Canales que aceptan publicidad: <b>{active_count}</b>\n\n"
+                "Activa o desactiva, canal por canal, si deseas que las campañas patrocinadas aparezcan en la botonera publicada en ese canal. "
+                "Si al menos uno está en ON, tu monetización queda activa automáticamente.",
+                parse_mode="HTML", reply_markup=self.money_channels_keyboard(uid),
+            )
+            return
+
+        if data.startswith("money:chantoggleview:"):
+            profile = self.db.get_monetization_profile(uid)
+            if not profile.get("accepted_terms_at"):
+                await q.answer("Primero acepta el programa de monetización.", show_alert=True)
+                return
+            chat_id = int(data.split(":", 2)[2])
+            ch = self.db.get_channel(chat_id)
+            if not ch or int(ch.get("owner_user_id") or 0) != uid or not ch.get("board_participation_enabled"):
+                await q.answer("Ese canal no puede usarse como fuente de publicidad.", show_alert=True)
+                return
+            if ch.get("status") != "approved" or not ch.get("permissions_ok"):
+                await q.answer("El canal debe estar aprobado y con permisos correctos.", show_alert=True)
+                return
+            new_value = not bool(ch.get("monetization_enabled"))
+            self.db.set_channel_monetization(chat_id, new_value)
+            if not new_value:
+                await self.disable_source_channel(context.bot, chat_id, "owner_monetization_disabled")
+            active_count = self.db.active_monetization_channel_count(uid)
+            await q.answer("Publicidad activada en este canal." if new_value else "Publicidad desactivada en este canal.", show_alert=True)
+            await q.edit_message_text(
+                "📢 <b>Publicidad pagada en mis canales</b>\n\n"
+                f"Estado general: <b>{'🟢 activa' if active_count else '⚪️ desactivada'}</b>\n"
+                f"Canales con publicidad ON: <b>{active_count}</b>\n\n"
+                "Puedes seguir activando o desactivando canales aquí.",
                 parse_mode="HTML", reply_markup=self.money_channels_keyboard(uid),
             )
             return
@@ -297,11 +349,11 @@ class MonetizationService:
             if not new_value:
                 await self.disable_source_channel(context.bot, chat_id, "owner_monetization_disabled")
             active_count = self.db.active_monetization_channel_count(uid)
-            await q.answer("Canal activado." if new_value else "Canal desactivado.", show_alert=True)
+            await q.answer("Publicidad activada en este canal." if new_value else "Publicidad desactivada en este canal.", show_alert=True)
             await q.edit_message_text(
-                "📡 <b>Canales monetizados</b>\n\n"
+                "📢 <b>Publicidad pagada en mis canales</b>\n\n"
                 f"Estado general: <b>{'🟢 activa' if active_count else '⚪️ desactivada'}</b>\n"
-                f"Canales activos: <b>{active_count}</b>",
+                f"Canales con publicidad ON: <b>{active_count}</b>",
                 parse_mode="HTML", reply_markup=self.money_channels_keyboard(uid),
             )
             return
@@ -557,6 +609,52 @@ class MonetizationService:
             )
             return True
 
+        if action == "admin_contact_budget" and self.is_admin(user.id):
+            try:
+                budget = Decimal(msg.text.strip().replace(",", "."))
+                if budget <= 0 or budget > Decimal("1000000"):
+                    raise InvalidOperation
+            except (InvalidOperation, ValueError):
+                await msg.reply_text("Presupuesto inválido. Ejemplo válido: 15 o 25.50")
+                return True
+            cid = int(payload.get('campaign_id') or 0)
+            campaign = self.db.get_sponsored_campaign(cid)
+            if not campaign or campaign.get('status') != 'contact_pending':
+                self.db.clear_session(user.id)
+                await msg.reply_text("La solicitud ya no está pendiente o fue resuelta por otro administrador.")
+                return True
+            budget_micros = int((budget * Decimal(1_000_000)).to_integral_value(rounding=ROUND_DOWN))
+            now = datetime.now(self.settings.timezone)
+            scheduled = now + timedelta(hours=self.settings.monetization_opportunity_hours)
+            max_end = scheduled + timedelta(hours=self.settings.monetization_max_campaign_hours)
+            ok = self.db.activate_manual_contact_campaign(
+                cid, user.id, budget_micros,
+                scheduled.isoformat(timespec='seconds'), max_end.isoformat(timespec='seconds'),
+            )
+            self.db.clear_session(user.id)
+            if not ok:
+                await msg.reply_text("No pude activar la solicitud; probablemente ya fue resuelta.")
+                return True
+            fresh = self.db.get_sponsored_campaign(cid)
+            await self.send_opportunities(context.bot, fresh)
+            await self.safe_dm(
+                context.bot, int(fresh['advertiser_user_id']),
+                f"✅ <b>Publicidad #{cid} activada por administración.</b>\n\n"
+                f"Canal: <b>{html.escape(fresh.get('title') or str(fresh.get('target_chat_id')))}</b>\n"
+                f"Objetivo: <b>{int(fresh.get('goal_members') or 0):,} miembros</b>\n"
+                f"Presupuesto registrado: <b>{usd_text(budget_micros)}</b>\n"
+                f"Inicio programado: <b>{scheduled.strftime('%d/%m/%Y %H:%M')}</b>.",
+                parse_mode='HTML',
+            )
+            await msg.reply_html(
+                f"✅ <b>Publicidad #{cid} activada</b>\n\n"
+                f"Presupuesto: <b>{usd_text(budget_micros)}</b>\n"
+                f"Inicio: <b>{scheduled.strftime('%d/%m/%Y %H:%M')}</b>\n\n"
+                "Las oportunidades ya fueron enviadas a los canales que tienen publicidad pagada en ON.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('💰 Monetización admin', callback_data='monadm:home')]]),
+            )
+            return True
+
         if action == "admin_manual_goal" and self.is_admin(user.id):
             try:
                 goal = int(msg.text.strip().replace(",", ""))
@@ -628,12 +726,13 @@ class MonetizationService:
 
         if data == "ads:home":
             campaigns = self.db.sponsored_campaigns_for_advertiser(uid, 100)
-            active = sum(1 for c in campaigns if c.get("status") in {"recruiting", "active", "settling"})
+            active = sum(1 for c in campaigns if c.get("status") in {"contact_pending", "paid_review", "recruiting", "active", "settling"})
             await q.edit_message_text(
                 "📢 <b>Publicidad</b>\n\n"
                 f"Campañas creadas: <b>{len(campaigns)}</b> · Activas/en proceso: <b>{active}</b>\n"
-                f"Tarifa actual: <b>{self.settings.monetization_stars_per_1000:,} ⭐ por 1,000 miembros objetivo</b>.\n\n"
-                "Las campañas se pagan con Telegram Stars y pasan por revisión administrativa antes de publicarse.",
+                f"Tarifa Stars: <b>{self.settings.monetization_stars_per_1000:,} ⭐ por 1,000 miembros objetivo</b>.\n\n"
+                "Al crear una campaña podrás usar Telegram Stars o generar una solicitud manual para coordinar con administración. "
+                "Ninguna solicitud manual se publica hasta que un administrador la active.",
                 parse_mode="HTML", reply_markup=self.ads_home_keyboard(uid),
             )
             return
@@ -736,9 +835,8 @@ class MonetizationService:
                 return
             rows = []
             for goal in self.settings.monetization_goals:
-                price = self.price_for_goal(goal)
                 rows.append([InlineKeyboardButton(
-                    f"🎯 {goal:,} miembros · {price:,} ⭐", callback_data=f"ads:goal:{chat_id}:{goal}", style="primary"
+                    f"🎯 {goal:,} miembros", callback_data=f"ads:goal:{chat_id}:{goal}", style="primary"
                 )])
             rows.append([InlineKeyboardButton("⬅️ Elegir canal", callback_data="ads:new")])
             await q.edit_message_text(
@@ -749,6 +847,37 @@ class MonetizationService:
             return
 
         if data.startswith("ads:goal:"):
+            _, _, raw_chat, raw_goal = data.split(":", 3)
+            chat_id, goal = int(raw_chat), int(raw_goal)
+            if goal not in self.settings.monetization_goals:
+                return
+            ch = self.db.get_channel(chat_id)
+            if not ch or int(ch.get("owner_user_id") or 0) != uid:
+                return
+            price = self.price_for_goal(goal)
+            rows = [
+                [InlineKeyboardButton(
+                    f"⭐ Telegram Stars · {price:,} ⭐",
+                    callback_data=f"ads:paystars:{chat_id}:{goal}",
+                    style="success",
+                )],
+                [InlineKeyboardButton(
+                    "🪙 USDT · coordinar con administrador",
+                    callback_data=f"ads:paymanual:{chat_id}:{goal}",
+                    style="primary",
+                )],
+                [InlineKeyboardButton("⬅️ Cambiar objetivo", callback_data=f"ads:target:{chat_id}")],
+            ]
+            await q.edit_message_text(
+                f"💳 <b>Método de gestión · {html.escape(ch.get('telegram_title') or str(chat_id))}</b>\n\n"
+                f"Objetivo: <b>{goal:,} miembros</b>\n\n"
+                f"⭐ <b>Stars:</b> pago integrado de <b>{price:,} ⭐</b> y revisión automática del pago.\n"
+                "🪙 <b>USDT:</b> genera una solicitud manual para hablar con un administrador; la campaña solo se activa cuando el administrador la aprueba.",
+                parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows),
+            )
+            return
+
+        if data.startswith("ads:paystars:"):
             _, _, raw_chat, raw_goal = data.split(":", 3)
             chat_id, goal = int(raw_chat), int(raw_goal)
             if goal not in self.settings.monetization_goals:
@@ -778,6 +907,52 @@ class MonetizationService:
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Mis campañas", callback_data="ads:list")]]),
             )
+            return
+
+        if data.startswith("ads:paymanual:"):
+            _, _, raw_chat, raw_goal = data.split(":", 3)
+            chat_id, goal = int(raw_chat), int(raw_goal)
+            if goal not in self.settings.monetization_goals:
+                return
+            ch = self.db.get_channel(chat_id)
+            if not ch or int(ch.get("owner_user_id") or 0) != uid:
+                return
+            entry_mode = "approval" if ch.get("invite_type") == "approval" else "direct"
+            payload = f"manual-contact:{uid}:{secrets.token_hex(12)}"
+            cid = self.db.create_manual_contact_campaign_request(
+                uid, chat_id, ch.get("telegram_title") or str(chat_id), goal, entry_mode, payload,
+            )
+            contact = self.admin_contact_label()
+            contact_url = self.admin_contact_url()
+            user_rows = []
+            if contact_url:
+                user_rows.append([InlineKeyboardButton("💬 Contactar administrador", url=contact_url, style="primary")])
+            user_rows.append([InlineKeyboardButton("📊 Mis campañas", callback_data="ads:list")])
+            await q.edit_message_text(
+                f"🪙 <b>Solicitud manual #{cid}</b>\n\n"
+                f"Canal: <b>{html.escape(ch.get('telegram_title') or str(chat_id))}</b>\n"
+                f"Objetivo: <b>{goal:,} miembros</b>\n"
+                f"Contacto administrativo: <b>{html.escape(contact)}</b>\n\n"
+                "La solicitud fue enviada a administración. Habla con el administrador para acordar los detalles. "
+                "La publicidad permanecerá desactivada hasta que un administrador la active manualmente desde su notificación.",
+                parse_mode="HTML", reply_markup=InlineKeyboardMarkup(user_rows),
+            )
+            admin_rows = [
+                [InlineKeyboardButton("💬 Contactar anunciante", url=f"tg://user?id={uid}")],
+                [InlineKeyboardButton("✅ Activar publicidad", callback_data=f"monadm:manualreqactivate:{cid}", style="success")],
+                [InlineKeyboardButton("❌ Rechazar solicitud", callback_data=f"monadm:manualreqreject:{cid}", style="danger")],
+            ]
+            for admin_id in self.settings.admin_ids:
+                await self.safe_dm(
+                    context.bot, admin_id,
+                    f"🪙 <b>Nueva solicitud manual #{cid}</b>\n\n"
+                    f"Anunciante: <code>{uid}</code>\n"
+                    f"Canal: <b>{html.escape(ch.get('telegram_title') or str(chat_id))}</b>\n"
+                    f"Objetivo: <b>{goal:,} miembros</b>\n"
+                    f"Modo de ingreso: <b>{'Solicitud' if entry_mode == 'approval' else 'Directo'}</b>\n\n"
+                    "La campaña todavía <b>NO está activa</b>. Cuando hayas acordado los detalles con el anunciante, pulsa Activar publicidad y define el presupuesto USD de la campaña.",
+                    parse_mode="HTML", reply_markup=InlineKeyboardMarkup(admin_rows),
+                )
             return
 
         if data == "ads:list":
@@ -935,7 +1110,7 @@ class MonetizationService:
             return
         profile = self.db.get_monetization_profile(uid)
         if not profile.get("accepted_terms_at") or self.db.active_monetization_channel_count(uid) < 1:
-            await q.answer("Activa al menos un canal desde 💰 Monetización.", show_alert=True)
+            await q.answer("Activa la publicidad pagada en al menos un canal desde 💰 Monetización.", show_alert=True)
             return
 
         if action == "open":
@@ -1000,18 +1175,57 @@ class MonetizationService:
         action = parts[1]
 
         if action == "home":
-            review = self.db.sponsored_campaigns_by_status(("paid_review",), 100)
+            review = self.db.sponsored_campaigns_by_status(("paid_review", "contact_pending"), 100)
             active = self.db.sponsored_campaigns_by_status(("recruiting", "active", "settling"), 100)
             usdt_withdrawals = self.db.usdt_withdrawals_by_status(("pending", "approved"), 100)
             await q.edit_message_text(
                 "💰 <b>Administración de monetización</b>\n\n"
-                f"Campañas Stars por revisar: <b>{len(review)}</b>\n"
+                f"Solicitudes/campañas por revisar: <b>{len(review)}</b>\n"
                 f"Campañas en proceso: <b>{len(active)}</b>\n"
                 f"Retiros USDT pendientes/aprobados: <b>{len(usdt_withdrawals)}</b>\n"
                 f"Tarifa Stars: <b>{self.settings.monetization_stars_per_1000} ⭐ / 1K</b>\n"
                 f"Comisión Stars plataforma: <b>{self.settings.monetization_platform_fee_bps/100:.1f}%</b>\n"
                 f"Retiro USDT: mínimo <b>${self.settings.monetization_usdt_min_withdraw_usd:.2f}</b> · comisión <b>${self.settings.monetization_usdt_fee_usd:.2f}</b>",
                 parse_mode="HTML", reply_markup=self.admin_home_keyboard(),
+            )
+            return
+
+        if action == "manualreqactivate":
+            cid = int(parts[2])
+            c = self.db.get_sponsored_campaign(cid)
+            if not c or c.get('status') != 'contact_pending':
+                await q.answer("La solicitud ya no está pendiente.", show_alert=True)
+                return
+            self.db.set_session(q.from_user.id, 'admin_contact_budget', payload={
+                'campaign_id': cid,
+                'title': c.get('title') or str(c.get('target_chat_id')),
+                'goal_members': int(c.get('goal_members') or 0),
+            })
+            await q.edit_message_text(
+                f"✅ <b>Activar solicitud manual #{cid}</b>\n\n"
+                f"Canal: <b>{html.escape(c.get('title') or '')}</b>\n"
+                f"Objetivo: <b>{int(c.get('goal_members') or 0):,} miembros</b>\n\n"
+                "Si ya llegaste a un acuerdo con el anunciante, escribe el <b>presupuesto total en USD</b> que se repartirá entre las conversiones verificadas. Ejemplo: <code>15</code>.",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Cancelar', callback_data=f'monadm:campaign:{cid}')]]),
+            )
+            return
+
+        if action == "manualreqreject":
+            cid = int(parts[2])
+            c = self.db.get_sponsored_campaign(cid)
+            if not c or c.get('status') != 'contact_pending':
+                await q.answer("La solicitud ya no está pendiente.", show_alert=True)
+                return
+            self.db.reject_sponsored_campaign(cid, q.from_user.id, 'Solicitud manual rechazada por administración.', refunded=False)
+            await self.safe_dm(
+                context.bot, int(c['advertiser_user_id']),
+                f"❌ <b>Solicitud de publicidad #{cid} rechazada.</b>\n\nPuedes crear otra solicitud desde 📢 Publicidad si deseas intentarlo nuevamente.",
+                parse_mode='HTML',
+            )
+            await q.edit_message_text(
+                f"❌ Solicitud manual #{cid} rechazada.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Campañas', callback_data='monadm:campaigns')]]),
             )
             return
 
@@ -1162,7 +1376,7 @@ class MonetizationService:
             return
 
         if action == "campaigns":
-            campaigns = self.db.sponsored_campaigns_by_status(("paid_review", "recruiting", "active", "settling"), 30)
+            campaigns = self.db.sponsored_campaigns_by_status(("contact_pending", "paid_review", "recruiting", "active", "settling"), 30)
             rows = [[InlineKeyboardButton(
                 f"#{c['id']} · {campaign_status_label(c['status'])[:20]} · {c['title'][:20]}",
                 callback_data=f"monadm:campaign:{c['id']}",
@@ -1179,7 +1393,11 @@ class MonetizationService:
             if not c:
                 return
             rows = []
-            if c.get("status") == "paid_review":
+            if c.get("status") == "contact_pending":
+                rows.append([InlineKeyboardButton("💬 Contactar anunciante", url=f"tg://user?id={int(c.get('advertiser_user_id') or 0)}")])
+                rows.append([InlineKeyboardButton("✅ Activar publicidad", callback_data=f"monadm:manualreqactivate:{cid}", style="success")])
+                rows.append([InlineKeyboardButton("❌ Rechazar solicitud", callback_data=f"monadm:manualreqreject:{cid}", style="danger")])
+            elif c.get("status") == "paid_review":
                 rows.append([InlineKeyboardButton("✅ Aprobar y reclutar", callback_data=f"monadm:approve:{cid}", style="success")])
                 rows.append([InlineKeyboardButton("❌ Rechazar + reembolsar", callback_data=f"monadm:reject:{cid}", style="danger")])
             rows.append([InlineKeyboardButton("⬅️ Campañas", callback_data="monadm:campaigns")])
@@ -1189,7 +1407,7 @@ class MonetizationService:
                 f"Anunciante: <code>{c.get('advertiser_user_id')}</code>\n"
                 f"Estado: <b>{html.escape(campaign_status_label(c.get('status')))}</b>\n"
                 f"Objetivo: <b>{int(c.get('goal_members') or 0):,}</b>\n"
-                f"Financiamiento: <b>{'Manual USD' if c.get('funding_type') == 'manual_usd' else 'Telegram Stars'}</b>\n"
+                f"Financiamiento: <b>{'Manual USD' if c.get('funding_type') == 'manual_usd' else ('Solicitud manual' if c.get('funding_type') == 'manual_contact' else 'Telegram Stars')}</b>\n"
                 f"Presupuesto/Pago: <b>{campaign_payment_text(c)}</b>\n"
                 f"Solicitudes: <b>{int(c.get('requests_count') or 0):,}</b> ({int(c.get('request_attempts_count') or 0):,} intentos) · "
                 f"Ingresos: <b>{int(c.get('joined_count') or 0):,}</b> · Verificados: <b>{int(c.get('verified_count') or 0):,}</b>",
@@ -1291,6 +1509,7 @@ class MonetizationService:
                     """SELECT COUNT(CASE WHEN funding_type='stars' AND paid_at IS NOT NULL THEN 1 END) star_campaigns,
                               COALESCE(SUM(CASE WHEN funding_type='stars' AND paid_at IS NOT NULL THEN stars_price ELSE 0 END),0) stars,
                               COUNT(CASE WHEN funding_type='manual_usd' THEN 1 END) manual_campaigns,
+                              COUNT(CASE WHEN funding_type='manual_contact' AND status='contact_pending' THEN 1 END) manual_pending,
                               COALESCE(SUM(CASE WHEN funding_type='manual_usd' THEN budget_usd_micros ELSE 0 END),0) manual_budget,
                               COALESCE(SUM(verified_count),0) verified FROM sponsored_campaigns"""
                 ).fetchone()
@@ -1301,10 +1520,11 @@ class MonetizationService:
                 f"Campañas Stars pagadas: <b>{int(row['star_campaigns'] or 0)}</b>\n"
                 f"Stars cobradas registradas: <b>{int(row['stars'] or 0):,} ⭐</b>\n"
                 f"Promociones manuales USD: <b>{int(row['manual_campaigns'] or 0)}</b>\n"
+                f"Solicitudes manuales pendientes: <b>{int(row['manual_pending'] or 0)}</b>\n"
                 f"Presupuesto manual acumulado: <b>{usd_text(row['manual_budget'])}</b>\n"
                 f"Conversiones verificadas: <b>{int(row['verified'] or 0):,}</b>\n"
                 f"Participantes monetizados: <b>{int(participants or 0)}</b>\n"
-                f"Canales con monetización habilitada: <b>{int(channel_optins or 0)}</b>",
+                f"Canales que aceptan publicidad pagada: <b>{int(channel_optins or 0)}</b>",
                 parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Monetización", callback_data="monadm:home")]]),
             )
             return
@@ -1317,7 +1537,8 @@ class MonetizationService:
     # ------------------------------------------------------------------
     async def _refund_and_cancel(self, bot, campaign: dict, reason: str) -> bool:
         refunded = False
-        charge_id = campaign.get("telegram_payment_charge_id")
+        is_stars = campaign.get('funding_type') == 'stars'
+        charge_id = campaign.get("telegram_payment_charge_id") if is_stars else None
         if charge_id:
             try:
                 await bot.refund_star_payment(
@@ -1328,10 +1549,15 @@ class MonetizationService:
             except TelegramError as exc:
                 log.warning("No se pudo reembolsar campaña %s: %s", campaign.get("id"), exc)
         self.db.reject_sponsored_campaign(int(campaign["id"]), 0, reason, refunded=refunded)
+        suffix = ""
+        if is_stars:
+            suffix = ("\n\n✅ El pago fue reembolsado en Telegram Stars." if refunded else
+                      "\n\n⚠️ El reembolso automático no pudo confirmarse; un administrador debe revisar la transacción.")
+        else:
+            suffix = "\n\nLa liquidación manual debe revisarse directamente con administración."
         await self.safe_dm(
             bot, campaign["advertiser_user_id"],
-            f"⚪️ <b>Campaña #{campaign['id']} cancelada.</b>\n\n{html.escape(reason)}\n\n"
-            + ("✅ El pago fue reembolsado en Telegram Stars." if refunded else "⚠️ El reembolso automático no pudo confirmarse; un administrador debe revisar la transacción."),
+            f"⚪️ <b>Campaña #{campaign['id']} cancelada.</b>\n\n{html.escape(reason)}" + suffix,
             parse_mode="HTML",
         )
         return refunded

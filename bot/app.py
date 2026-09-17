@@ -1111,7 +1111,7 @@ async def participant_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             + (f"🔘 Botón: <b>{html.escape(ch.get('button_title') or '—')}</b>\n" if board_enabled else "")
             + (f"🎨 Color: <b>{html.escape(ch.get('button_style') or 'default')}</b>\n" if board_enabled else "")
             + f"🔗 Ingreso: <b>{html.escape(invite_mode_label(ch.get('invite_type')))}</b>\n"
-            + (f"💰 Monetización como fuente: <b>{'🟢 activa' if ch.get('monetization_enabled') else '⚪️ desactivada'}</b>\n" if board_enabled else "💰 Monetización como fuente: <b>No aplica</b>\n")
+            + (f"📢 Publicidad pagada en mi botonera: <b>{'🟢 ON' if ch.get('monetization_enabled') else '⚪️ OFF'}</b>\n" if board_enabled else "📢 Publicidad pagada: <b>No aplica</b>\n")
             + f"🕐 Próxima botonera: <b>{html.escape(next_text)}</b>"
         )
         await q.edit_message_text(
@@ -1123,7 +1123,7 @@ async def participant_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         # Compatibilidad con botones enviados por versiones anteriores. Desde v7.3
         # toda la configuración se centraliza dentro de 💰 Monetización.
         await q.edit_message_text(
-            "💰 <b>Configuración de monetización</b>\n\nAhora puedes activar o desactivar todos tus canales desde un solo lugar.",
+            "📢 <b>Publicidad pagada por canal</b>\n\nAquí decides en cuáles de tus canales pueden aparecer campañas patrocinadas. Puedes activar o desactivar cada canal por separado.",
             parse_mode="HTML", reply_markup=monetization.money_channels_keyboard(user_id),
         )
         return
