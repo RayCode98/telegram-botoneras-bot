@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS channels (
     suspended_at TEXT,
     suspended_by_admin_id INTEGER,
     monetization_enabled INTEGER NOT NULL DEFAULT 0,
+    board_participation_enabled INTEGER NOT NULL DEFAULT 1,
+    promotion_target_enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -477,6 +479,8 @@ class Database:
         self._ensure_column("sponsored_campaigns", "request_attempts_count", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("sponsored_sources", "request_attempts_count", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("channels", "monetization_enabled", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("channels", "board_participation_enabled", "INTEGER NOT NULL DEFAULT 1")
+        self._ensure_column("channels", "promotion_target_enabled", "INTEGER NOT NULL DEFAULT 1")
         self._ensure_column("sponsored_campaigns", "funding_type", "TEXT NOT NULL DEFAULT 'stars'")
         self._ensure_column("sponsored_campaigns", "budget_usd_micros", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("sponsored_campaigns", "participant_pool_usd_micros", "INTEGER NOT NULL DEFAULT 0")
@@ -776,12 +780,12 @@ class Database:
     def publication_candidates(self, category: str | None = None) -> list[dict]:
         if category:
             return self.all(
-                """SELECT * FROM channels WHERE status IN ('approved','permission_suspended') AND category=?
+                """SELECT * FROM channels WHERE board_participation_enabled=1 AND status IN ('approved','permission_suspended') AND category=?
                    ORDER BY COALESCE(button_title, telegram_title) COLLATE NOCASE""",
                 (category,),
             )
         return self.all(
-            """SELECT * FROM channels WHERE status IN ('approved','permission_suspended')
+            """SELECT * FROM channels WHERE board_participation_enabled=1 AND status IN ('approved','permission_suspended')
                ORDER BY category, COALESCE(button_title, telegram_title) COLLATE NOCASE"""
         )
 
@@ -805,14 +809,14 @@ class Database:
         if category:
             return self.all(
                 """
-                SELECT * FROM channels WHERE status='approved' AND category=?
+                SELECT * FROM channels WHERE board_participation_enabled=1 AND status='approved' AND category=?
                 ORDER BY COALESCE(button_title, telegram_title) COLLATE NOCASE
                 """,
                 (category,),
             )
         return self.all(
             """
-            SELECT * FROM channels WHERE status='approved'
+            SELECT * FROM channels WHERE board_participation_enabled=1 AND status='approved'
             ORDER BY category, COALESCE(button_title, telegram_title) COLLATE NOCASE
             """
         )
@@ -857,7 +861,7 @@ class Database:
 
     def participant_channels_for_audit(self) -> list[dict]:
         return self.all(
-            "SELECT * FROM channels WHERE status IN ('approved','below_minimum') ORDER BY updated_at",
+            "SELECT * FROM channels WHERE board_participation_enabled=1 AND status IN ('approved','below_minimum') ORDER BY updated_at",
         )
 
     def channel_stats_history(self, user_id: int, chat_id: int, limit: int = 5, offset: int = 0) -> list[dict]:
@@ -1228,7 +1232,7 @@ class Database:
                    c.category AS channel_category, c.status AS channel_status
             FROM campaign_channels cc
             JOIN channels c ON c.chat_id=cc.chat_id
-            WHERE cc.campaign_id=? AND c.status='approved'
+            WHERE cc.campaign_id=? AND c.board_participation_enabled=1 AND c.status='approved'
               AND cc.invite_link IS NOT NULL AND cc.link_revoked_at IS NULL
               AND cc.link_error IS NULL
             ORDER BY COALESCE(c.button_title, c.telegram_title) COLLATE NOCASE
@@ -1439,6 +1443,9 @@ class Database:
         }
 
     def set_monetization_enabled(self, user_id: int, enabled: bool):
+        # Compatibilidad interna: desde v7.3 el estado general se deriva de los
+        # canales activados. Este método se conserva para migraciones/llamadas
+        # antiguas, pero la UI ya no usa un interruptor global independiente.
         self.ensure_monetization_profile(user_id)
         now = now_iso()
         self.execute(
@@ -1446,6 +1453,58 @@ class Database:
                updated_at=? WHERE user_id=?""",
             (int(enabled), int(enabled), now, now, user_id),
         )
+
+    def accept_monetization_terms(self, user_id: int):
+        self.ensure_monetization_profile(user_id)
+        now = now_iso()
+        self.execute(
+            "UPDATE monetization_profiles SET accepted_terms_at=COALESCE(accepted_terms_at, ?), updated_at=? WHERE user_id=?",
+            (now, now, user_id),
+        )
+        self.sync_monetization_profile(user_id)
+
+    def monetization_source_channels(self, user_id: int) -> list[dict]:
+        """Canales del usuario que pueden configurarse como fuentes monetizadas.
+
+        Solo canales de botonera aprobados pueden generar ingresos. Los canales
+        registrados únicamente como destino publicitario quedan fuera de esta lista.
+        """
+        return self.all(
+            """SELECT * FROM channels
+               WHERE owner_user_id=? AND board_participation_enabled=1
+               ORDER BY CASE status WHEN 'approved' THEN 0 ELSE 1 END, telegram_title COLLATE NOCASE""",
+            (user_id,),
+        )
+
+    def active_monetization_channel_count(self, user_id: int) -> int:
+        row = self.one(
+            """SELECT COUNT(*) AS n FROM channels
+               WHERE owner_user_id=? AND board_participation_enabled=1 AND status='approved'
+                 AND permissions_ok=1 AND monetization_enabled=1""",
+            (user_id,),
+        )
+        return int((row or {}).get('n') or 0)
+
+    def sync_monetization_profile(self, user_id: int) -> bool:
+        self.ensure_monetization_profile(user_id)
+        profile = self.one("SELECT * FROM monetization_profiles WHERE user_id=?", (user_id,)) or {}
+        accepted = bool(profile.get('accepted_terms_at'))
+        active = bool(accepted and self.active_monetization_channel_count(user_id) > 0)
+        self.execute(
+            "UPDATE monetization_profiles SET enabled=?, updated_at=? WHERE user_id=?",
+            (int(active), now_iso(), user_id),
+        )
+        return active
+
+    def set_channel_monetization(self, chat_id: int, enabled: bool) -> bool:
+        ch = self.get_channel(chat_id)
+        if not ch:
+            return False
+        self.set_channel_fields(chat_id, monetization_enabled=int(enabled))
+        owner = ch.get('owner_user_id')
+        if owner:
+            self.sync_monetization_profile(int(owner))
+        return True
 
     def set_opportunity_notifications(self, user_id: int, enabled: bool):
         self.ensure_monetization_profile(user_id)
@@ -1458,15 +1517,30 @@ class Database:
         return self.all(
             """SELECT mp.*, u.private_chat_id, u.username, u.first_name
                FROM monetization_profiles mp JOIN users u ON u.user_id=mp.user_id
-               WHERE mp.enabled=1 AND mp.opportunity_notifications=1"""
+               WHERE mp.accepted_terms_at IS NOT NULL AND mp.opportunity_notifications=1
+                 AND EXISTS (
+                    SELECT 1 FROM channels c
+                    WHERE c.owner_user_id=mp.user_id AND c.board_participation_enabled=1
+                      AND c.status='approved' AND c.permissions_ok=1 AND c.monetization_enabled=1
+                 )"""
         )
 
     def eligible_monetization_channels(self, user_id: int, target_chat_id: int | None = None) -> list[dict]:
         params: list[Any] = [user_id]
-        sql = """SELECT * FROM channels WHERE owner_user_id=? AND status='approved' AND permissions_ok=1 AND monetization_enabled=1"""
+        sql = """SELECT * FROM channels WHERE owner_user_id=? AND board_participation_enabled=1 AND status='approved' AND permissions_ok=1 AND monetization_enabled=1"""
         if target_chat_id is not None:
             sql += " AND chat_id<>?"
             params.append(target_chat_id)
+        sql += " ORDER BY telegram_title COLLATE NOCASE"
+        return self.all(sql, params)
+
+    def advertising_target_channels(self, user_id: int | None = None) -> list[dict]:
+        params: list[Any] = []
+        sql = """SELECT * FROM channels
+                 WHERE promotion_target_enabled=1 AND status='approved' AND permissions_ok=1"""
+        if user_id is not None:
+            sql += " AND owner_user_id=?"
+            params.append(user_id)
         sql += " ORDER BY telegram_title COLLATE NOCASE"
         return self.all(sql, params)
 

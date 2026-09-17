@@ -88,7 +88,7 @@ class ModerationService:
         # no es una infracción. Esto cubre configuring, pending_review, rejected,
         # withdrawn, below_minimum, etc. permission_suspended conserva el carácter
         # de canal previamente aprobado y sí se trata como participación vigente.
-        approved_participation = previous_status in {"approved", "permission_suspended"}
+        approved_participation = bool(channel.get("board_participation_enabled", 1)) and previous_status in {"approved", "permission_suspended"}
         # Si Telegram informa quién ejecutó la acción, se sanciona a esa persona.
         # Si no hay actor útil, recae en el responsable registrado del canal.
         responsible = actor_user_id or owner_id

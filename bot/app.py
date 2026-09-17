@@ -37,6 +37,8 @@ from .keyboards import (
     color_keyboard,
     lifetime_actions_keyboard,
     link_type_keyboard,
+    channel_purpose_keyboard,
+    promotion_entry_keyboard,
     owner_channel_keyboard,
     publish_confirm_keyboard,
     publish_delete_confirm_keyboard,
@@ -54,6 +56,7 @@ from .keyboards import (
     participant_withdraw_confirm_keyboard,
     participant_add_channel_keyboard,
     manual_channel_verification_keyboard,
+    promotion_channel_verification_keyboard,
     appeal_admin_keyboard,
     system_admin_keyboard,
     system_back_keyboard,
@@ -89,6 +92,7 @@ def parse_category(value: str | None) -> str | None:
 
 
 MANUAL_CHANNEL_REQUEST_ID = 61001
+PROMOTION_CHANNEL_REQUEST_ID = 62001
 
 
 def invite_mode_label(value: str | None) -> str:
@@ -112,13 +116,24 @@ def required_channel_permissions(member) -> list[str]:
     return [label for attr, label in required if not bool(getattr(member, attr, False))]
 
 
+def required_promotion_target_permissions(member) -> list[str]:
+    """Permisos mínimos para un canal que solo comprará promoción."""
+    if member.status == ChatMemberStatus.OWNER:
+        return []
+    return [] if bool(getattr(member, "can_invite_users", False)) else ["Invitar usuarios / crear enlaces"]
+
+
 def fmt_channel(ch: dict) -> str:
     owner = ch.get("owner_user_id")
     sanction = db.get_sanction(owner) if owner else {"strikes": 0, "banned": 0}
+    board_enabled = bool(ch.get("board_participation_enabled", 1))
+    promo_enabled = bool(ch.get("promotion_target_enabled", 1))
+    usage = "Botonera + promoción" if board_enabled and promo_enabled else ("Botonera" if board_enabled else "Solo promoción")
     lines = [
         f"<b>{html.escape(ch.get('telegram_title') or 'Sin título')}</b>",
         f"ID: <code>{ch['chat_id']}</code>",
-        f"Botón: <b>{html.escape(ch.get('button_title') or '—')}</b>",
+        f"Uso: <b>{html.escape(usage)}</b>",
+        f"Botón: <b>{html.escape(ch.get('button_title') or '—')}</b>" if board_enabled else "Botón: <b>No aplica</b>",
         f"Miembros: <b>{int(ch.get('member_count') or 0):,}</b>",
         f"Categoría: <b>{html.escape(ch.get('category') or '—')}</b>",
     ]
@@ -358,6 +373,103 @@ async def verify_channel_command(update: Update, context: ContextTypes.DEFAULT_T
     await send_manual_channel_verification(update.effective_message)
 
 
+async def promotion_target_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Registra un canal como objetivo publicitario sin volverlo canal de botonera."""
+    msg = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    shared = getattr(msg, "chat_shared", None) if msg else None
+    if not msg or not user or not chat or chat.type != ChatType.PRIVATE or not shared:
+        return
+
+    try:
+        await msg.reply_text("🔎 Verificando canal para promoción…", reply_markup=ReplyKeyboardRemove())
+    except TelegramError:
+        pass
+
+    if db.is_banned(user.id) and not is_admin(user.id):
+        await msg.reply_html("🚫 Tu cuenta está bloqueada y no puede registrar canales.")
+        return
+
+    chat_id = int(shared.chat_id)
+    existing = db.get_channel(chat_id)
+    if existing and existing.get("owner_user_id") and int(existing["owner_user_id"]) != int(user.id) and not is_admin(user.id):
+        db.record_ownership_conflict(
+            chat_id, existing.get("owner_user_id"), user.id, user.username,
+            "Intento de registrar como objetivo publicitario un canal perteneciente a otra cuenta.",
+        )
+        await msg.reply_html("⛔ <b>Este canal ya está registrado por otra cuenta.</b>")
+        return
+
+    try:
+        bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
+        requester_member = await context.bot.get_chat_member(chat_id, user.id)
+        info = await context.bot.get_chat(chat_id)
+        count = await context.bot.get_chat_member_count(chat_id)
+    except TelegramError as exc:
+        await msg.reply_html(
+            "❌ No pude verificar completamente el canal. Confirma que el bot siga dentro como administrador.\n\n"
+            f"<code>{html.escape(str(exc))}</code>"
+        )
+        return
+
+    if bot_member.status != ChatMemberStatus.ADMINISTRATOR:
+        await msg.reply_html("⚠️ El bot debe ser <b>administrador</b> del canal para medir y crear enlaces de campaña.")
+        return
+    if requester_member.status not in {ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR} and not is_admin(user.id):
+        await msg.reply_html("⛔ Tu cuenta debe ser propietaria o administradora de ese canal.")
+        return
+
+    # Si ya era un canal de botonera, conserva sus exigencias completas. Si es
+    # nuevo/solo promoción, únicamente necesitamos poder crear enlaces/invitar.
+    if existing and existing.get("board_participation_enabled"):
+        missing = required_channel_permissions(bot_member)
+    else:
+        missing = required_promotion_target_permissions(bot_member)
+    if missing:
+        await msg.reply_html(
+            "⚠️ <b>Faltan permisos para usar este canal en publicidad.</b>\n\n• " +
+            "\n• ".join(map(html.escape, missing))
+        )
+        return
+
+    category = category_from_members(count, settings.min_members)
+    owner_id = existing.get("owner_user_id") if existing and existing.get("owner_user_id") else user.id
+    db.upsert_channel(chat_id, info.title or str(chat_id), info.username, owner_id, count, category)
+    # Un registro nuevo desde Publicidad NO entra a la botonera. Si ya participaba,
+    # respetamos su configuración y pasa a tener ambos usos.
+    board_enabled = int(existing.get("board_participation_enabled") or 0) if existing else 0
+    db.set_channel_fields(
+        chat_id,
+        board_participation_enabled=board_enabled,
+        promotion_target_enabled=1,
+        status="approved",
+        monetization_enabled=int(existing.get("monetization_enabled") or 0) if existing else 0,
+    )
+    db.set_channel_permission_state(chat_id, True, None)
+    fresh = db.get_channel(chat_id) or {}
+
+    if fresh.get("invite_type") in {"direct", "approval"}:
+        await msg.reply_html(
+            "✅ <b>Canal listo para promoción.</b>\n\n"
+            f"{html.escape(info.title or str(chat_id))}\n"
+            f"Miembros actuales: <b>{count:,}</b>\n"
+            f"Uso: <b>{'Botonera + promoción' if board_enabled else 'Solo promoción / compra de subs'}</b>\n\n"
+            "Este canal puede comprar campañas sin publicar la botonera en su propio canal.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📢 Ir a Publicidad", callback_data="ads:home", style="success")]]),
+        )
+        return
+
+    await msg.reply_html(
+        "✅ <b>Canal registrado para promoción.</b>\n\n"
+        f"{html.escape(info.title or str(chat_id))}\n"
+        f"Miembros: <b>{count:,}</b>\n\n"
+        "Este canal <b>no publicará botoneras</b>. Solo será destino de campañas para adquirir suscriptores.\n\n"
+        "Selecciona cómo ingresarán los usuarios durante las campañas:",
+        reply_markup=promotion_entry_keyboard(chat_id),
+    )
+
+
 async def manual_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Recupera un alta cuando my_chat_member no llegó o ya expiró.
 
@@ -372,7 +484,11 @@ async def manual_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not msg or not user or not chat or chat.type != ChatType.PRIVATE or not shared:
         return
 
-    if int(getattr(shared, "request_id", -1)) != MANUAL_CHANNEL_REQUEST_ID:
+    request_id = int(getattr(shared, "request_id", -1))
+    if request_id == PROMOTION_CHANNEL_REQUEST_ID:
+        await promotion_target_chat_shared(update, context)
+        return
+    if request_id != MANUAL_CHANNEL_REQUEST_ID:
         return
 
     # Quita inmediatamente el teclado de selección para evitar dobles envíos.
@@ -527,8 +643,8 @@ async def manual_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"{html.escape(info.title or str(chat_id))}\n"
         f"Miembros: <b>{count:,}</b>\n"
         f"Categoría: <b>{html.escape(category)}</b>\n\n"
-        "Ahora selecciona cómo deberá comportarse el enlace del botón:",
-        reply_markup=link_type_keyboard(chat_id),
+        "¿Cómo quieres utilizar este canal dentro del sistema?",
+        reply_markup=channel_purpose_keyboard(chat_id),
     )
 
 
@@ -551,7 +667,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Cambio de permisos de un bot que ya era administrador. La suspensión por
         # permisos NO suma una falta y se revierte automáticamente al restaurarlos.
         if existing:
-            missing = required_channel_permissions(new)
+            missing = (required_channel_permissions(new) if existing.get("board_participation_enabled", 1) else required_promotion_target_permissions(new))
             db.set_channel_permission_state(chat.id, not missing, "; ".join(missing) if missing else None)
             if missing and existing.get("status") == "approved":
                 db.set_channel_fields(
@@ -580,7 +696,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await publisher.refresh_category(context.bot, existing["category"])
                 await safe_dm(
                     context.bot, existing.get("owner_user_id"),
-                    "✅ <b>Permisos restaurados.</b> Tu canal vuelve a participar automáticamente.",
+                    "✅ <b>Permisos restaurados.</b> Tu canal vuelve a estar habilitado automáticamente.",
                     parse_mode="HTML",
                 )
             return
@@ -684,11 +800,10 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.upsert_channel(chat.id, info.title or str(chat.id), info.username, owner_id, count, category)
     db.set_channel_fields(chat.id, status="configuring")
 
+    # De momento registramos el estado de permisos completos. Si el usuario elige
+    # "solo promoción", se recalculará con el conjunto mínimo de permisos.
     missing = required_channel_permissions(new)
     db.set_channel_permission_state(chat.id, not missing, "; ".join(missing) if missing else None)
-    warning = ""
-    if missing:
-        warning = "\n\n⚠️ <b>Permisos faltantes:</b>\n• " + "\n• ".join(map(html.escape, missing))
 
     delivered = await safe_dm(
         context.bot,
@@ -697,12 +812,122 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>{html.escape(info.title or str(chat.id))}</b>\n"
         f"Miembros: <b>{count:,}</b>\n"
         f"Categoría: <b>{html.escape(category)}</b>\n\n"
-        "Selecciona si el enlace permitirá ingreso directo o requerirá aprobación:" + warning,
+        "¿Cómo quieres utilizar este canal?\n\n"
+        "📣 <b>Participar en botoneras:</b> publicará las botoneras y podrá generar ganancias.\n"
+        "🎯 <b>Solo promocionar:</b> no publicará botoneras; únicamente podrá comprar/adquirir suscriptores.\n"
+        "🔄 <b>Ambos:</b> podrá hacer las dos cosas.",
         parse_mode="HTML",
-        reply_markup=link_type_keyboard(chat.id),
+        reply_markup=channel_purpose_keyboard(chat.id),
     )
     if not delivered:
         log.info("El responsable %s debe ejecutar /start para configurar %s", owner_id, chat.id)
+
+
+async def config_purpose_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if db.is_banned(q.from_user.id) and not is_admin(q.from_user.id):
+        await q.answer("Tu cuenta está bloqueada.", show_alert=True)
+        return
+    _, purpose, raw_id = q.data.split(":", 2)
+    chat_id = int(raw_id)
+    ch = db.get_channel(chat_id)
+    if not ch or (int(ch.get("owner_user_id") or 0) != q.from_user.id and not is_admin(q.from_user.id)):
+        await q.answer("No tienes permiso para configurar ese canal.", show_alert=True)
+        return
+    if purpose not in {"board", "promotion", "both"}:
+        return
+
+    try:
+        member = await context.bot.get_chat_member(chat_id, context.bot.id)
+    except TelegramError as exc:
+        await q.message.reply_html(f"❌ No pude verificar permisos: <code>{html.escape(str(exc))}</code>")
+        return
+
+    if member.status != ChatMemberStatus.ADMINISTRATOR:
+        await q.answer("El bot debe seguir siendo administrador.", show_alert=True)
+        return
+
+    if purpose == "promotion":
+        missing = required_promotion_target_permissions(member)
+        if missing:
+            await q.message.reply_html("⚠️ Para promoción faltan permisos:\n• " + "\n• ".join(map(html.escape, missing)))
+            return
+        was_board = bool(ch.get("board_participation_enabled", 1))
+        old_category = ch.get("category")
+        db.set_channel_fields(
+            chat_id, board_participation_enabled=0, promotion_target_enabled=1,
+            monetization_enabled=0, status="approved", button_title=None, button_style="default",
+        )
+        db.set_channel_permission_state(chat_id, True, None)
+        db.sync_monetization_profile(int(ch.get("owner_user_id") or q.from_user.id))
+        if was_board:
+            await monetization.disable_source_channel(context.bot, chat_id, "changed_to_promotion_only")
+            await publisher.delete_active_posts_for_chat(context.bot, chat_id, "changed_to_promotion_only")
+            if old_category in CATEGORIES:
+                await publisher.refresh_category(context.bot, old_category)
+        await q.message.reply_html(
+            "🎯 <b>Canal configurado para solo promoción.</b>\n\n"
+            "No publicará botoneras ni aparecerá como botón participante. Podrá ser objetivo de campañas para adquirir suscriptores.\n\n"
+            "Selecciona cómo ingresarán los usuarios cuando se promocione:",
+            reply_markup=promotion_entry_keyboard(chat_id),
+        )
+        return
+
+    # board / both: necesitan permisos completos de publicación.
+    missing = required_channel_permissions(member)
+    if missing:
+        db.set_channel_permission_state(chat_id, False, "; ".join(missing))
+        await q.message.reply_html(
+            "⚠️ <b>Para participar en botoneras faltan permisos:</b>\n• " +
+            "\n• ".join(map(html.escape, missing)) +
+            "\n\nRestaura esos permisos y vuelve a seleccionar el uso del canal."
+        )
+        return
+    db.set_channel_fields(
+        chat_id, board_participation_enabled=1, promotion_target_enabled=1 if purpose == "both" else 0,
+        status="configuring",
+    )
+    db.set_channel_permission_state(chat_id, True, None)
+    await q.message.reply_html(
+        "📣 <b>Canal configurado para botoneras" + (" y promoción" if purpose == "both" else "") + ".</b>\n\n"
+        "Ahora selecciona cómo deberá funcionar el enlace del botón:",
+        reply_markup=link_type_keyboard(chat_id),
+    )
+
+
+async def promotion_entry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, kind, raw_id = q.data.split(":", 2)
+    chat_id = int(raw_id)
+    ch = db.get_channel(chat_id)
+    if not ch or (int(ch.get("owner_user_id") or 0) != q.from_user.id and not is_admin(q.from_user.id)):
+        await q.answer("No tienes permiso.", show_alert=True)
+        return
+    if kind not in {"direct", "approval"}:
+        return
+    try:
+        member = await context.bot.get_chat_member(chat_id, context.bot.id)
+        missing = required_promotion_target_permissions(member)
+    except TelegramError as exc:
+        await q.message.reply_html(f"❌ No pude verificar el canal: <code>{html.escape(str(exc))}</code>")
+        return
+    if member.status != ChatMemberStatus.ADMINISTRATOR or missing:
+        await q.answer("El bot necesita ser admin y poder crear enlaces/invitar usuarios.", show_alert=True)
+        return
+    db.set_channel_fields(
+        chat_id, invite_type=kind, promotion_target_enabled=1, status="approved",
+        board_participation_enabled=int(ch.get("board_participation_enabled") or 0),
+    )
+    db.set_channel_permission_state(chat_id, True, None)
+    await q.message.reply_html(
+        "✅ <b>Canal listo para campañas.</b>\n\n"
+        f"Tipo de ingreso: <b>{'Solicitud de ingreso' if kind == 'approval' else 'Ingreso directo'}</b>\n"
+        f"Uso: <b>{'Botonera + promoción' if ch.get('board_participation_enabled') else 'Solo promoción / compra de subs'}</b>\n\n"
+        "Ya puedes crear una campaña para este canal desde 📢 Publicidad.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📢 Ir a Publicidad", callback_data="ads:home", style="success")]]),
+    )
 
 
 async def config_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -872,57 +1097,34 @@ async def participant_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             ch = db.get_channel(chat_id) or ch
         except TelegramError:
             count = int(ch.get("member_count") or 0)
-        nxt = _next_start_for_category(ch.get("category") or "") if ch.get("status") == "approved" else None
-        next_text = nxt.strftime("%d/%m/%Y %H:%M") if nxt else "No programada / no elegible"
+        board_enabled = bool(ch.get("board_participation_enabled", 1))
+        nxt = _next_start_for_category(ch.get("category") or "") if ch.get("status") == "approved" and board_enabled else None
+        next_text = nxt.strftime("%d/%m/%Y %H:%M") if nxt else ("No aplica (solo promoción)" if not board_enabled else "No programada / no elegible")
+        usage = "Botonera + promoción" if board_enabled and ch.get("promotion_target_enabled") else ("Botonera" if board_enabled else "Solo promoción / compra de subs")
         text = (
             f"📡 <b>{html.escape(ch.get('telegram_title') or str(chat_id))}</b>\n\n"
             f"👥 Suscriptores: <b>{count:,}</b>\n"
+            f"🎯 Uso: <b>{html.escape(usage)}</b>\n"
             f"📊 Categoría: <b>{html.escape(ch.get('category') or '—')}</b>\n"
-            + (f"🔄 Próxima categoría: <b>{html.escape(ch.get('pending_category'))}</b>\n" if ch.get("pending_category") else "")
+            + (f"🔄 Próxima categoría: <b>{html.escape(ch.get('pending_category'))}</b>\n" if ch.get("pending_category") and board_enabled else "")
             + f"Estado: <b>{html.escape(ch.get('status') or '—')}</b>\n"
-            f"🔘 Botón: <b>{html.escape(ch.get('button_title') or '—')}</b>\n"
-            f"🎨 Color: <b>{html.escape(ch.get('button_style') or 'default')}</b>\n"
-            f"🔗 Ingreso: <b>{html.escape(invite_mode_label(ch.get('invite_type')))}</b>\n"
-            f"💰 Monetización del canal: <b>{'🟢 activa' if ch.get('monetization_enabled') else '⚪️ desactivada'}</b>\n"
-            f"🕐 Próxima botonera: <b>{html.escape(next_text)}</b>"
+            + (f"🔘 Botón: <b>{html.escape(ch.get('button_title') or '—')}</b>\n" if board_enabled else "")
+            + (f"🎨 Color: <b>{html.escape(ch.get('button_style') or 'default')}</b>\n" if board_enabled else "")
+            + f"🔗 Ingreso: <b>{html.escape(invite_mode_label(ch.get('invite_type')))}</b>\n"
+            + (f"💰 Monetización como fuente: <b>{'🟢 activa' if ch.get('monetization_enabled') else '⚪️ desactivada'}</b>\n" if board_enabled else "💰 Monetización como fuente: <b>No aplica</b>\n")
+            + f"🕐 Próxima botonera: <b>{html.escape(next_text)}</b>"
         )
         await q.edit_message_text(
             text, parse_mode="HTML",
-            reply_markup=participant_channel_keyboard(chat_id, ch.get("status") or "", bool(ch.get("monetization_enabled")))
+            reply_markup=participant_channel_keyboard(chat_id, ch.get("status") or "", bool(ch.get("monetization_enabled")), bool(ch.get("board_participation_enabled", 1)))
         )
         return
     if data.startswith("user:monetchan:"):
-        chat_id = int(data.split(":", 2)[2])
-        ch = db.get_channel(chat_id)
-        if not ch or ch.get("owner_user_id") != user_id:
-            await q.answer("Ese canal no te pertenece.", show_alert=True)
-            return
-        profile = db.get_monetization_profile(user_id)
-        if not profile.get("enabled"):
-            await q.answer("Primero activa el programa de monetización desde 💰 Monetización.", show_alert=True)
-            return
-        new_value = 0 if ch.get("monetization_enabled") else 1
-        db.set_channel_fields(chat_id, monetization_enabled=new_value)
-        if not new_value:
-            await monetization.disable_source_channel(context.bot, chat_id, "owner_monetization_disabled")
-        await q.answer("Monetización del canal activada." if new_value else "Monetización del canal desactivada.", show_alert=True)
-        ch = db.get_channel(chat_id) or ch
-        nxt = _next_start_for_category(ch.get("category") or "") if ch.get("status") == "approved" else None
-        next_text = nxt.strftime("%d/%m/%Y %H:%M") if nxt else "No programada / no elegible"
-        text = (
-            f"📡 <b>{html.escape(ch.get('telegram_title') or str(chat_id))}</b>\n\n"
-            f"👥 Suscriptores: <b>{int(ch.get('member_count') or 0):,}</b>\n"
-            f"📊 Categoría: <b>{html.escape(ch.get('category') or '—')}</b>\n"
-            f"Estado: <b>{html.escape(ch.get('status') or '—')}</b>\n"
-            f"🔘 Botón: <b>{html.escape(ch.get('button_title') or '—')}</b>\n"
-            f"🎨 Color: <b>{html.escape(ch.get('button_style') or 'default')}</b>\n"
-            f"🔗 Ingreso: <b>{html.escape(invite_mode_label(ch.get('invite_type')))}</b>\n"
-            f"💰 Monetización del canal: <b>{'🟢 activa' if ch.get('monetization_enabled') else '⚪️ desactivada'}</b>\n"
-            f"🕐 Próxima botonera: <b>{html.escape(next_text)}</b>"
-        )
+        # Compatibilidad con botones enviados por versiones anteriores. Desde v7.3
+        # toda la configuración se centraliza dentro de 💰 Monetización.
         await q.edit_message_text(
-            text, parse_mode="HTML",
-            reply_markup=participant_channel_keyboard(chat_id, ch.get("status") or "", bool(ch.get("monetization_enabled")))
+            "💰 <b>Configuración de monetización</b>\n\nAhora puedes activar o desactivar todos tus canales desde un solo lugar.",
+            parse_mode="HTML", reply_markup=monetization.money_channels_keyboard(user_id),
         )
         return
 
@@ -2894,6 +3096,8 @@ def build_application() -> Application:
     app.add_handler(PreCheckoutQueryHandler(monetization.precheckout_handler))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, monetization.successful_payment_handler))
 
+    app.add_handler(CallbackQueryHandler(config_purpose_callback, pattern=r"^cfg_purpose:"))
+    app.add_handler(CallbackQueryHandler(promotion_entry_callback, pattern=r"^adsentry:"))
     app.add_handler(CallbackQueryHandler(config_link_callback, pattern=r"^cfg_link:"))
     app.add_handler(CallbackQueryHandler(config_color_callback, pattern=r"^cfg_color:"))
     app.add_handler(CallbackQueryHandler(owner_callback, pattern=r"^owner:"))

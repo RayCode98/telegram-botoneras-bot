@@ -527,3 +527,42 @@ USDT a enviar: 72 USDT
 El bot no realiza la transferencia cripto automáticamente. La solicitud llega al panel administrativo, donde debe aprobarse. Después de realizar manualmente la transferencia, el administrador marca el retiro como pagado.
 
 El bot conserva por separado cualquier contabilidad antigua relacionada con campañas Stars. No convierte automáticamente Stars a USD/USDT.
+
+---
+
+# v7.3 · Monetización centralizada y canales de solo promoción
+
+## Monetización por canales
+
+La monetización ya no depende de un interruptor global separado. El participante entra en:
+
+`💰 Monetización → 📡 Configurar mis canales`
+
+y activa o desactiva cada canal desde ahí.
+
+El estado general se calcula automáticamente:
+
+- al menos un canal elegible en `ON` → `🟢 Monetización activa`;
+- ningún canal elegible en `ON` → `⚪️ Monetización desactivada`.
+
+Solo canales que participan en la botonera, están aprobados y mantienen los permisos necesarios pueden utilizarse como **fuente monetizada**.
+
+## Canal solo para comprar suscriptores
+
+Un cliente no necesita publicar botoneras para adquirir suscriptores.
+
+Al agregar/verificar un canal puede elegir:
+
+- `📣 Participar en botoneras`
+- `🎯 Solo promocionar / comprar subs`
+- `🔄 Ambos usos`
+
+Un canal configurado como `Solo promoción` queda disponible en `📢 Publicidad`, pero no se incluye en publicaciones de botonera ni genera ingresos como fuente.
+
+También puede registrarse directamente desde:
+
+`📢 Publicidad → 🎯 Mis canales para promocionar → ➕ Agregar canal solo para promoción`
+
+Para este tipo de canal el bot necesita ser administrador y poder crear enlaces/invitar usuarios. No necesita permisos para publicar, editar o eliminar mensajes porque la botonera no se enviará allí.
+
+Los canales existentes anteriores a v7.3 conservan ambos usos habilitados para no romper su configuración.

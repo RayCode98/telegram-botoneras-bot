@@ -47,6 +47,22 @@ def link_type_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+def channel_purpose_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    """Define si el canal publicará botoneras, solo comprará promoción o ambos."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📣 Participar en botoneras", callback_data=f"cfg_purpose:board:{chat_id}", style="primary")],
+        [InlineKeyboardButton("🎯 Solo promocionar / comprar subs", callback_data=f"cfg_purpose:promotion:{chat_id}", style="success")],
+        [InlineKeyboardButton("🔄 Ambos usos", callback_data=f"cfg_purpose:both:{chat_id}")],
+    ])
+
+
+def promotion_entry_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚪 Ingreso directo", callback_data=f"adsentry:direct:{chat_id}", style="success")],
+        [InlineKeyboardButton("🛂 Solicitud de ingreso", callback_data=f"adsentry:approval:{chat_id}", style="primary")],
+    ])
+
+
 def manual_channel_verification_keyboard(request_id: int = 61001) -> ReplyKeyboardMarkup:
     """Selector nativo de Telegram para recuperar/verificar un canal manualmente.
 
@@ -107,6 +123,40 @@ def manual_channel_verification_keyboard(request_id: int = 61001) -> ReplyKeyboa
         resize_keyboard=True,
         one_time_keyboard=True,
         input_field_placeholder="Selecciona el canal que deseas verificar",
+    )
+
+
+def promotion_channel_verification_keyboard(request_id: int = 62001) -> ReplyKeyboardMarkup:
+    """Selector para canales que solo serán destino de campañas pagadas.
+
+    No exige permisos de publicación/edición porque ese canal no recibirá la botonera;
+    solo necesita que el bot sea administrador y pueda crear enlaces/invitaciones.
+    """
+    user_rights = ChatAdministratorRights(
+        is_anonymous=False, can_manage_chat=True, can_delete_messages=False,
+        can_manage_video_chats=False, can_restrict_members=False, can_promote_members=True,
+        can_change_info=False, can_invite_users=True, can_post_stories=False,
+        can_edit_stories=False, can_delete_stories=False, can_post_messages=False,
+        can_edit_messages=False, can_pin_messages=False, can_manage_topics=False,
+        can_manage_direct_messages=False, can_manage_tags=False,
+    )
+    bot_rights = ChatAdministratorRights(
+        is_anonymous=False, can_manage_chat=True, can_delete_messages=False,
+        can_manage_video_chats=False, can_restrict_members=False, can_promote_members=False,
+        can_change_info=False, can_invite_users=True, can_post_stories=False,
+        can_edit_stories=False, can_delete_stories=False, can_post_messages=False,
+        can_edit_messages=False, can_pin_messages=False, can_manage_topics=False,
+        can_manage_direct_messages=False, can_manage_tags=False,
+    )
+    request = KeyboardButtonRequestChat(
+        request_id=request_id, chat_is_channel=True,
+        user_administrator_rights=user_rights, bot_administrator_rights=bot_rights,
+        bot_is_member=True, request_title=True, request_username=True,
+    )
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("🎯 Seleccionar canal para promocionar", request_chat=request)]],
+        resize_keyboard=True, one_time_keyboard=True,
+        input_field_placeholder="Selecciona el canal que comprará suscriptores",
     )
 
 
@@ -333,18 +383,28 @@ def participant_channels_keyboard(channels: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def participant_channel_keyboard(chat_id: int, status: str, monetization_enabled: bool = False) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("✏️ Editar título", callback_data=f"owner:title:{chat_id}"), InlineKeyboardButton("🎨 Cambiar color", callback_data=f"owner:color:{chat_id}")],
-        [InlineKeyboardButton("🔗 Cambiar enlace", callback_data=f"owner:link:{chat_id}")],
-        [InlineKeyboardButton("📊 Estadísticas", callback_data=f"user:statsch:{chat_id}:0"), InlineKeyboardButton("📈 Progreso", callback_data=f"user:progress:{chat_id}")],
-        [InlineKeyboardButton(
-            "💰 Monetización del canal: ON" if monetization_enabled else "💰 Monetización del canal: OFF",
-            callback_data=f"user:monetchan:{chat_id}",
-            style="success" if monetization_enabled else "primary",
-        )],
-    ]
-    if status == "approved":
+def participant_channel_keyboard(
+    chat_id: int, status: str, monetization_enabled: bool = False, board_participation_enabled: bool = True
+) -> InlineKeyboardMarkup:
+    rows = []
+    if board_participation_enabled:
+        rows.extend([
+            [InlineKeyboardButton("✏️ Editar título", callback_data=f"owner:title:{chat_id}"), InlineKeyboardButton("🎨 Cambiar color", callback_data=f"owner:color:{chat_id}")],
+            [InlineKeyboardButton("🔗 Cambiar enlace", callback_data=f"owner:link:{chat_id}")],
+            [InlineKeyboardButton("📊 Estadísticas", callback_data=f"user:statsch:{chat_id}:0"), InlineKeyboardButton("📈 Progreso", callback_data=f"user:progress:{chat_id}")],
+            [InlineKeyboardButton(
+                "💰 Configurar monetización",
+                callback_data="money:channels",
+                style="success" if monetization_enabled else "primary",
+            )],
+        ])
+    else:
+        rows.extend([
+            [InlineKeyboardButton("🎯 Crear campaña para este canal", callback_data=f"ads:target:{chat_id}", style="success")],
+            [InlineKeyboardButton("🔗 Cambiar tipo de ingreso", callback_data=f"ads:entrymenu:{chat_id}", style="primary")],
+            [InlineKeyboardButton("📢 Ir a Publicidad", callback_data="ads:home")],
+        ])
+    if status == "approved" and board_participation_enabled:
         rows.append([InlineKeyboardButton("🚪 Retirar canal", callback_data=f"user:withdrawask:{chat_id}", style="danger")])
     elif status in {"withdrawn", "suspended", "permission_suspended", "inactive", "rejected", "below_minimum"}:
         rows.append([InlineKeyboardButton("♻️ Solicitar reactivación", callback_data=f"owner:reactivate:{chat_id}", style="primary")])

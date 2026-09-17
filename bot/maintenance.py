@@ -119,9 +119,15 @@ class MaintenanceService:
 
         missing: list[str] = []
         if member.status != ChatMemberStatus.OWNER:
-            for attr, label in REQUIRED_CHANNEL_RIGHTS:
-                if not bool(getattr(member, attr, False)):
-                    missing.append(label)
+            # Los canales registrados únicamente como destino publicitario no
+            # publican botoneras; solo necesitan crear enlaces/invitaciones.
+            if not bool(channel.get("board_participation_enabled", 1)):
+                if not bool(getattr(member, "can_invite_users", False)):
+                    missing.append("Invitar usuarios / crear enlaces")
+            else:
+                for attr, label in REQUIRED_CHANNEL_RIGHTS:
+                    if not bool(getattr(member, attr, False)):
+                        missing.append(label)
         return not missing, missing
 
     async def audit_permissions(self, bot, publisher, *, notify: bool = True) -> dict:
@@ -174,7 +180,7 @@ class MaintenanceService:
                             "⚠️ <b>Canal suspendido preventivamente.</b>\n\n"
                             f"Canal: <b>{html.escape(channel.get('telegram_title') or str(channel['chat_id']))}</b>\n"
                             f"Problema: <b>{html.escape(issue_text or 'permisos incompletos')}</b>\n\n"
-                            "No participará en nuevas publicaciones hasta que restaures los permisos. El sistema lo reactivará automáticamente cuando estén correctos.",
+                            "Quedará temporalmente fuera de su función configurada hasta que restaures los permisos. El sistema lo reactivará automáticamente cuando estén correctos.",
                             parse_mode="HTML",
                         )
                 details.append({"chat_id": channel["chat_id"], "issues": issues})

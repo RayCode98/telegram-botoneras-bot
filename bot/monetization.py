@@ -13,6 +13,7 @@ from telegram.error import BadRequest, Forbidden, TelegramError
 
 from .config import Settings
 from .db import Database
+from .keyboards import promotion_channel_verification_keyboard
 
 log = logging.getLogger(__name__)
 
@@ -103,14 +104,9 @@ class MonetizationService:
         return max(0.0, (10000 - self.settings.monetization_platform_fee_bps) / 100)
 
     def _owner_channels_for_advertising(self, user_id: int) -> list[dict]:
-        rows = []
-        for ch in self.db.channels_for_owner(user_id):
-            if not ch.get("permissions_ok"):
-                continue
-            if ch.get("status") in {"banned", "withdrawn", "inactive"}:
-                continue
-            rows.append(ch)
-        return rows
+        # Un canal anunciado NO necesita participar en botoneras. Puede estar
+        # registrado únicamente como destino publicitario.
+        return self.db.advertising_target_channels(user_id)
 
     async def refresh_source_boards(self, bot, source_chat_id: int) -> dict:
         edited = failed = 0
@@ -136,19 +132,38 @@ class MonetizationService:
     # ------------------------------------------------------------------
     def money_home_keyboard(self, user_id: int) -> InlineKeyboardMarkup:
         profile = self.db.get_monetization_profile(user_id)
-        enabled = bool(profile.get("enabled"))
+        active_count = self.db.active_monetization_channel_count(user_id)
         rows = [
+            [InlineKeyboardButton("📡 Configurar mis canales", callback_data="money:channels", style="success" if active_count else "primary")],
             [InlineKeyboardButton("ℹ️ Cómo funciona", callback_data="money:info", style="primary")],
             [InlineKeyboardButton("💵 Mi monedero", callback_data="money:wallet", style="success")],
             [InlineKeyboardButton("📣 Oportunidades", callback_data="money:opportunities")],
             [InlineKeyboardButton("📊 Mis campañas pagadas", callback_data="money:history")],
-            [InlineKeyboardButton(
-                "⏸ Desactivar monetización" if enabled else "✅ Activar monetización",
-                callback_data="money:toggle",
-                style="danger" if enabled else "primary",
-            )],
-            [InlineKeyboardButton("⬅️ Mi panel", callback_data="user:home")],
         ]
+        if not profile.get("accepted_terms_at"):
+            rows.insert(1, [InlineKeyboardButton("✅ Aceptar programa de monetización", callback_data="money:toggle", style="primary")])
+        rows.append([InlineKeyboardButton("⬅️ Mi panel", callback_data="user:home")])
+        return InlineKeyboardMarkup(rows)
+
+    def money_channels_keyboard(self, user_id: int) -> InlineKeyboardMarkup:
+        channels = self.db.monetization_source_channels(user_id)
+        rows = []
+        for ch in channels[:40]:
+            eligible = ch.get("status") == "approved" and bool(ch.get("permissions_ok"))
+            enabled = bool(ch.get("monetization_enabled")) and eligible
+            icon = "🟢" if enabled else ("⚪️" if eligible else "⚠️")
+            title = (ch.get("telegram_title") or str(ch["chat_id"]))[:42]
+            if eligible:
+                rows.append([InlineKeyboardButton(
+                    f"{icon} {title} · {'ON' if enabled else 'OFF'}",
+                    callback_data=f"money:chantoggle:{ch['chat_id']}",
+                    style="success" if enabled else None,
+                )])
+            else:
+                rows.append([InlineKeyboardButton(f"{icon} {title} · no elegible", callback_data="money:noop")])
+        if not rows:
+            rows.append([InlineKeyboardButton("No tienes canales de botonera elegibles", callback_data="money:noop")])
+        rows.append([InlineKeyboardButton("⬅️ Monetización", callback_data="money:home")])
         return InlineKeyboardMarkup(rows)
 
     async def money_callback(self, update, context):
@@ -162,6 +177,9 @@ class MonetizationService:
 
         if data == "money:home":
             profile = self.db.get_monetization_profile(uid)
+            self.db.sync_monetization_profile(uid)
+            profile = self.db.get_monetization_profile(uid)
+            active_count = self.db.active_monetization_channel_count(uid)
             usd_wallet = self.db.usd_wallet_summary(uid)
             legacy = self.db.wallet_summary(uid)
             legacy_line = ""
@@ -169,18 +187,17 @@ class MonetizationService:
                 legacy_line = f"Saldo legado Stars-equivalente: <b>{milli_xtr_text(legacy['available_milli'])}</b>\n"
             text = (
                 f"💰 <b>Monetización</b>\n\n"
-                f"Estado general: <b>{'🟢 activa' if profile.get('enabled') else '⚪️ desactivada'}</b>\n"
+                f"Estado general: <b>{'🟢 activa' if active_count else '⚪️ desactivada'}</b> · Canales activos: <b>{active_count}</b>\n"
                 f"Saldo USD disponible: <b>{usd_text(usd_wallet['available_micros'])}</b>\n"
                 f"USD pendiente de validación: <b>{usd_text(usd_wallet['pending_micros'])}</b>\n"
                 f"{legacy_line}\n"
                 "<b>¿Cómo funciona?</b>\n"
-                "• Tú decides si entrar al programa y qué canales pueden monetizar.\n"
+                "• La monetización se activa automáticamente cuando al menos uno de tus canales está en ON.\n"
                 "• Antes de una campaña recibes una invitación para participar.\n"
                 f"• Solo los suscriptores atribuidos y válidos después de {self.settings.monetization_retention_hours}h generan ganancia.\n"
                 "• En promociones manuales, quien aporte más conversiones válidas recibe una mayor parte del presupuesto.\n"
                 f"• Puedes solicitar retiro por USDT desde ${self.settings.monetization_usdt_min_withdraw_usd:.2f}; comisión fija ${self.settings.monetization_usdt_fee_usd:.2f}.\n\n"
-                "Puedes activar o desactivar nuevas oportunidades cuando quieras. "
-                "Además, cada canal puede habilitarse o deshabilitarse individualmente desde 📡 Mis canales."
+                "Configura todo desde <b>📡 Configurar mis canales</b>. Si todos quedan en OFF, tu monetización se considera desactivada automáticamente."
             )
             await q.edit_message_text(text, parse_mode="HTML", reply_markup=self.money_home_keyboard(uid))
             return
@@ -209,38 +226,83 @@ class MonetizationService:
 
         if data == "money:toggle":
             profile = self.db.get_monetization_profile(uid)
-            if bool(profile.get("enabled")):
-                self.db.set_monetization_enabled(uid, False)
+            if profile.get("accepted_terms_at"):
                 await q.edit_message_text(
-                    "⏸ <b>Monetización desactivada.</b>\n\nNo recibirás nuevas oportunidades. "
-                    "Las participaciones ya iniciadas y tus ganancias acumuladas se conservan.",
-                    parse_mode="HTML", reply_markup=self.money_home_keyboard(uid),
+                    "💰 <b>La monetización se controla por canal.</b>\n\n"
+                    "Activa o desactiva tus canales desde el listado. El estado general será 🟢 activo mientras al menos un canal elegible esté en ON.",
+                    parse_mode="HTML", reply_markup=self.money_channels_keyboard(uid),
                 )
                 return
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Acepto y activar", callback_data="money:accept", style="success")],
+                [InlineKeyboardButton("✅ Acepto y continuar", callback_data="money:accept", style="success")],
                 [InlineKeyboardButton("❌ Cancelar", callback_data="money:home")],
             ])
             await q.edit_message_text(
-                "💰 <b>Activar monetización</b>\n\n"
-                "Al activarla aceptas estas reglas básicas:\n\n"
+                "💰 <b>Programa de monetización</b>\n\n"
+                "Al continuar aceptas estas reglas básicas:\n\n"
                 "• participar en cada campaña es voluntario;\n"
-                "• la primera fuente atribuida a un usuario es la que conserva la conversión;\n"
+                "• la primera fuente atribuida a un usuario conserva la conversión;\n"
                 f"• una conversión solo genera saldo si permanece al menos <b>{self.settings.monetization_retention_hours} horas</b>;\n"
                 "• reingresos, bots, administradores del canal objetivo y actividad fraudulenta no generan saldo;\n"
-                "• el monedero mostrado por el bot es <b>contabilidad interna</b>, no Stars transferibles automáticamente;\n"
-                "• los retiros requieren revisión y liquidación administrativa.\n\n"
-                "Puedes desactivar nuevas oportunidades cuando quieras sin perder el saldo acumulado.",
+                "• los retiros requieren revisión administrativa.\n\n"
+                "Después podrás elegir exactamente qué canales monetizan.",
                 parse_mode="HTML", reply_markup=kb,
             )
             return
 
         if data == "money:accept":
-            self.db.set_monetization_enabled(uid, True)
+            self.db.accept_monetization_terms(uid)
             await q.edit_message_text(
-                "✅ <b>Monetización activada.</b>\n\n"
-                "Recibirás oportunidades antes de las campañas. Para participar, activa también la monetización de cada canal desde 📡 Mis canales.",
-                parse_mode="HTML", reply_markup=self.money_home_keyboard(uid),
+                "✅ <b>Programa aceptado.</b>\n\nAhora activa uno o más canales. En cuanto al menos uno quede en ON, tu monetización se activará automáticamente.",
+                parse_mode="HTML", reply_markup=self.money_channels_keyboard(uid),
+            )
+            return
+
+        if data == "money:channels":
+            profile = self.db.get_monetization_profile(uid)
+            if not profile.get("accepted_terms_at"):
+                await q.edit_message_text(
+                    "💰 <b>Primero acepta el programa de monetización.</b>\n\nDespués podrás elegir tus canales desde este mismo apartado.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ Ver reglas y continuar", callback_data="money:toggle", style="success")],
+                        [InlineKeyboardButton("⬅️ Monetización", callback_data="money:home")],
+                    ]),
+                )
+                return
+            active_count = self.db.active_monetization_channel_count(uid)
+            await q.edit_message_text(
+                "📡 <b>Canales monetizados</b>\n\n"
+                f"Canales activos: <b>{active_count}</b>\n\n"
+                "Activa los canales que quieras usar para generar ganancias. Si al menos uno está en ON, la monetización general queda activa automáticamente.",
+                parse_mode="HTML", reply_markup=self.money_channels_keyboard(uid),
+            )
+            return
+
+        if data.startswith("money:chantoggle:"):
+            profile = self.db.get_monetization_profile(uid)
+            if not profile.get("accepted_terms_at"):
+                await q.answer("Primero acepta el programa de monetización.", show_alert=True)
+                return
+            chat_id = int(data.split(":", 2)[2])
+            ch = self.db.get_channel(chat_id)
+            if not ch or int(ch.get("owner_user_id") or 0) != uid or not ch.get("board_participation_enabled"):
+                await q.answer("Ese canal no puede usarse como fuente de monetización.", show_alert=True)
+                return
+            if ch.get("status") != "approved" or not ch.get("permissions_ok"):
+                await q.answer("El canal debe estar aprobado y con permisos correctos.", show_alert=True)
+                return
+            new_value = not bool(ch.get("monetization_enabled"))
+            self.db.set_channel_monetization(chat_id, new_value)
+            if not new_value:
+                await self.disable_source_channel(context.bot, chat_id, "owner_monetization_disabled")
+            active_count = self.db.active_monetization_channel_count(uid)
+            await q.answer("Canal activado." if new_value else "Canal desactivado.", show_alert=True)
+            await q.edit_message_text(
+                "📡 <b>Canales monetizados</b>\n\n"
+                f"Estado general: <b>{'🟢 activa' if active_count else '⚪️ desactivada'}</b>\n"
+                f"Canales activos: <b>{active_count}</b>",
+                parse_mode="HTML", reply_markup=self.money_channels_keyboard(uid),
             )
             return
 
@@ -550,6 +612,7 @@ class MonetizationService:
     def ads_home_keyboard(self, user_id: int) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Nueva campaña", callback_data="ads:new", style="success")],
+            [InlineKeyboardButton("🎯 Mis canales para promocionar", callback_data="ads:targets", style="primary")],
             [InlineKeyboardButton("📊 Mis campañas", callback_data="ads:list")],
             [InlineKeyboardButton("⬅️ Mi panel", callback_data="user:home")],
         ])
@@ -575,6 +638,76 @@ class MonetizationService:
             )
             return
 
+        if data == "ads:targets":
+            channels = self._owner_channels_for_advertising(uid)
+            rows = [[InlineKeyboardButton(
+                f"🎯 {(ch.get('telegram_title') or str(ch['chat_id']))[:48]}",
+                callback_data=f"ads:targetinfo:{ch['chat_id']}"
+            )] for ch in channels[:40]]
+            rows.append([InlineKeyboardButton("➕ Agregar canal solo para promoción", callback_data="ads:addtarget", style="success")])
+            rows.append([InlineKeyboardButton("⬅️ Publicidad", callback_data="ads:home")])
+            await q.edit_message_text(
+                "🎯 <b>Canales para promocionar</b>\n\n"
+                "Estos canales pueden comprar suscriptores sin publicar ninguna botonera. El bot solo necesita ser administrador para crear enlaces y medir ingresos.",
+                parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows),
+            )
+            return
+
+        if data == "ads:addtarget":
+            me = await context.bot.get_me()
+            add_url = f"https://t.me/{me.username}?startchannel&admin=invite_users" if me.username else None
+            intro_rows = []
+            if add_url:
+                intro_rows.append([InlineKeyboardButton("➕ Agregar bot al canal", url=add_url, style="success")])
+            intro_rows.append([InlineKeyboardButton("⬅️ Publicidad", callback_data="ads:home")])
+            await q.message.reply_html(
+                "🎯 <b>Agregar canal solo para promoción</b>\n\n"
+                "Este canal será únicamente <b>destino de campañas</b>: podrá comprar suscriptores, pero <b>NO publicará botoneras</b>.\n\n"
+                "1. Agrega el bot como administrador con permiso para <b>invitar usuarios / crear enlaces</b>.\n"
+                "2. Después usa el selector que aparecerá debajo para verificarlo.",
+                reply_markup=InlineKeyboardMarkup(intro_rows),
+            )
+            await q.message.reply_text(
+                "Cuando el bot ya sea administrador, selecciona aquí el canal:",
+                reply_markup=promotion_channel_verification_keyboard(),
+            )
+            return
+
+        if data.startswith("ads:entrymenu:"):
+            chat_id = int(data.split(":", 2)[2])
+            ch = self.db.get_channel(chat_id)
+            if not ch or int(ch.get("owner_user_id") or 0) != uid or not ch.get("promotion_target_enabled"):
+                await q.answer("Canal no disponible.", show_alert=True)
+                return
+            from .keyboards import promotion_entry_keyboard
+            await q.edit_message_text(
+                f"🔗 <b>Tipo de ingreso · {html.escape(ch.get('telegram_title') or str(chat_id))}</b>\n\n"
+                "Selecciona cómo ingresarán los usuarios durante las campañas:",
+                parse_mode="HTML", reply_markup=promotion_entry_keyboard(chat_id),
+            )
+            return
+
+        if data.startswith("ads:targetinfo:"):
+            chat_id = int(data.split(":", 2)[2])
+            ch = self.db.get_channel(chat_id)
+            if not ch or int(ch.get("owner_user_id") or 0) != uid or not ch.get("promotion_target_enabled"):
+                await q.answer("Canal no disponible.", show_alert=True)
+                return
+            usage = "Solo promoción" if not ch.get("board_participation_enabled") else "Botonera + promoción"
+            await q.edit_message_text(
+                f"🎯 <b>{html.escape(ch.get('telegram_title') or str(chat_id))}</b>\n\n"
+                f"Uso: <b>{usage}</b>\n"
+                f"Miembros: <b>{int(ch.get('member_count') or 0):,}</b>\n"
+                f"Tipo de ingreso: <b>{'Solicitud de ingreso' if ch.get('invite_type') == 'approval' else 'Ingreso directo'}</b>\n\n"
+                "Este canal puede ser objetivo de campañas aunque no participe en la botonera normal.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ Crear campaña", callback_data=f"ads:target:{chat_id}", style="success")],
+                    [InlineKeyboardButton("⬅️ Mis canales para promocionar", callback_data="ads:targets")],
+                ]),
+            )
+            return
+
         if data == "ads:new":
             channels = self._owner_channels_for_advertising(uid)
             if not channels:
@@ -582,7 +715,7 @@ class MonetizationService:
                     "📢 <b>Nueva campaña</b>\n\nPrimero agrega/verifica como administrador el canal que deseas promocionar.",
                     parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("➕ Agregar/verificar canal", callback_data="user:add", style="success")],
+                        [InlineKeyboardButton("🎯 Agregar canal para promoción", callback_data="ads:addtarget", style="success")],
                         [InlineKeyboardButton("⬅️ Publicidad", callback_data="ads:home")],
                     ]),
                 )
@@ -800,8 +933,9 @@ class MonetizationService:
         if not campaign or campaign.get("status") != "recruiting":
             await q.answer("Esta oportunidad ya no está abierta.", show_alert=True)
             return
-        if not self.db.get_monetization_profile(uid).get("enabled"):
-            await q.answer("Activa monetización primero.", show_alert=True)
+        profile = self.db.get_monetization_profile(uid)
+        if not profile.get("accepted_terms_at") or self.db.active_monetization_channel_count(uid) < 1:
+            await q.answer("Activa al menos un canal desde 💰 Monetización.", show_alert=True)
             return
 
         if action == "open":
@@ -883,9 +1017,7 @@ class MonetizationService:
 
         if action == "manualnew":
             self.db.clear_session(q.from_user.id)
-            channels = self.db.all(
-                """SELECT * FROM channels WHERE status='approved' AND permissions_ok=1 ORDER BY telegram_title COLLATE NOCASE LIMIT 50"""
-            )
+            channels = self.db.advertising_target_channels()[:50]
             rows = [[InlineKeyboardButton(
                 (ch.get('telegram_title') or str(ch['chat_id']))[:52],
                 callback_data=f"monadm:manualtarget:{ch['chat_id']}",
@@ -903,7 +1035,7 @@ class MonetizationService:
         if action == "manualtarget":
             chat_id = int(parts[2])
             ch = self.db.get_channel(chat_id)
-            if not ch or ch.get('status') != 'approved' or not ch.get('permissions_ok'):
+            if not ch or ch.get('status') != 'approved' or not ch.get('permissions_ok') or not ch.get('promotion_target_enabled'):
                 await q.answer("Ese canal no está disponible para promoción.", show_alert=True)
                 return
             self.db.set_session(q.from_user.id, 'admin_manual_goal', payload={
@@ -1215,7 +1347,7 @@ class MonetizationService:
 
         # Verifica que el canal objetivo siga accesible antes de crear enlaces.
         target = self.db.get_channel(c["target_chat_id"])
-        if not target or target.get("status") not in {"approved", "permission_suspended"} or not target.get("permissions_ok"):
+        if not target or not target.get("promotion_target_enabled", 1) or target.get("status") not in {"approved", "permission_suspended"} or not target.get("permissions_ok"):
             await self._refund_and_cancel(bot, c, "El canal promocionado ya no tiene los permisos necesarios para crear y medir enlaces de campaña.")
             return {"started": False, "reason": "target_permissions"}
 
@@ -1226,7 +1358,7 @@ class MonetizationService:
         active_sources = []
         for src in sources:
             channel = self.db.get_channel(src["source_chat_id"])
-            if not channel or channel.get("status") != "approved" or not channel.get("permissions_ok") or not channel.get("monetization_enabled"):
+            if not channel or not channel.get("board_participation_enabled", 1) or channel.get("status") != "approved" or not channel.get("permissions_ok") or not channel.get("monetization_enabled"):
                 self.db.upsert_sponsored_source(campaign_id, src["source_chat_id"], src["source_owner_user_id"], False)
                 continue
             name = f"SP{campaign_id}-SRC{abs(int(src['source_chat_id'])) % 1000000}"[:32]
